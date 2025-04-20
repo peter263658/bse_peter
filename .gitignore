@@ -8,3 +8,5 @@ __pycache__/
 DCNN/datasets/DATASET/
 evaluation_results/
 *.log
+outputs/
+mbstoi.egg*
