@@ -1,0 +1,5 @@
+model:
+  binaural: true
+  attention: true
+  use_clstm: True
+  use_cbn: True

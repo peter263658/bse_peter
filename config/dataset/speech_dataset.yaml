@@ -1,0 +1,8 @@
+sr: 16000
+noisy_training_dataset_dir:       /home/R12K41024/Research/BCCTN/DCNN/datasets/DATASET/noisy_trainset_1f
+noisy_validation_dataset_dir:     /home/R12K41024/Research/BCCTN/DCNN/datasets/DATASET/noisy_valset_1f
+noisy_test_dataset_dir:           /home/R12K41024/Research/BCCTN/DCNN/datasets/DATASET/noisy_testset_1f
+target_training_dataset_dir:      /home/R12K41024/Research/BCCTN/DCNN/datasets/DATASET/clean_trainset_1f
+target_validation_dataset_dir:    /home/R12K41024/Research/BCCTN/DCNN/datasets/DATASET/clean_valset_1f
+target_test_dataset_dir:          /home/R12K41024/Research/BCCTN/DCNN/datasets/DATASET/clean_testset_1f
+

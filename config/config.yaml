@@ -1,0 +1,26 @@
+dataset:
+  noisy_test_dataset_dir: /home/R12K41024/Research/BCCTN/DCNN/datasets/DATASET/noisy_testset_1f
+  noisy_training_dataset_dir: /home/R12K41024/Research/BCCTN/DCNN/datasets/DATASET/noisy_trainset_1f
+  noisy_validation_dataset_dir: /home/R12K41024/Research/BCCTN/DCNN/datasets/DATASET/noisy_valset_1f
+  target_test_dataset_dir: /home/R12K41024/Research/BCCTN/DCNN/datasets/DATASET/clean_testset_1f
+  target_training_dataset_dir: /home/R12K41024/Research/BCCTN/DCNN/datasets/DATASET/clean_trainset_1f
+  target_validation_dataset_dir: /home/R12K41024/Research/BCCTN/DCNN/datasets/DATASET/clean_valset_1f
+defaults:
+- model
+- training
+- dataset: speech_dataset
+model:
+  attention: true
+  ild_weight: 1
+  ipd_weight: 10
+  snr_loss_weight: 1
+  stoi_weight: 10
+training:
+  accelerator: cuda
+  batch_size: 20
+  learning_rate: 0.0001
+  n_epochs: 20
+  n_workers: 4
+  pin_memory: true
+  strategy: ddp_spawn
+  train_checkpoint_path: null
