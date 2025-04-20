@@ -5,3 +5,6 @@ __pycache__/
 .env
 *.pth
 .vscode/
+DCNN/datasets/DATASET/
+evaluation_results/
+*.log
