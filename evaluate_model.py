@@ -1,67 +1,110 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+"""
+Simplified Binaural Speech Enhancement Model Evaluator
+
+This script evaluates a trained BCCTN model on binaural speech signals with different SNR levels.
+It produces comprehensive metrics for each SNR level including:
+- STOI (Short-Time Objective Intelligibility)
+- MBSTOI (Modified Binaural STOI)
+- SegSNR (Segmental Signal-to-Noise Ratio)
+- ILD and IPD preservation (Interaural Level and Phase Differences)
+
+Usage:
+  python evaluate_model.py --checkpoint MODEL_CHECKPOINT 
+                          --data_root DATA_DIR 
+                          [--output_dir OUTPUT_DIR]
+                          [--num_samples N]
+"""
+
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import librosa
-import librosa.display
 import soundfile as sf
 import os
-from tqdm import tqdm
+import re
+import argparse
 from pathlib import Path
-import sys
+from collections import defaultdict
+import pandas as pd
+from tqdm import tqdm
 
 from hydra.core.global_hydra import GlobalHydra
 from hydra import compose, initialize
 
+# Import model-specific components
 from DCNN.trainer import DCNNLightningModule
-from DCNN.datasets.base_dataset import BaseDataset
 from DCNN.feature_extractors import Stft, IStft
 from torchmetrics.audio.stoi import ShortTimeObjectiveIntelligibility
 
-# Try to import PESQ - it might not be installed
+# Try to import MBSTOI
 try:
-    from pesq import pesq
-    PESQ_AVAILABLE = True
-except ImportError:
-    print("Warning: PESQ not available. Install it with 'pip install pesq'")
-    PESQ_AVAILABLE = False
-
-try:
-    # Try direct import from MBSTOI package
     from MBSTOI.mbstoi import mbstoi
-    print("Using MBSTOI from MBSTOI package")
     MBSTOI_AVAILABLE = True
+    print("MBSTOI library available")
 except ImportError:
     try:
-        # Try with relative import 
+        # Alternative import path
         import sys
-        import os
-        # Add parent directory to path
         sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         from MBSTOI.mbstoi import mbstoi
-        print("Using MBSTOI with relative import")
         MBSTOI_AVAILABLE = True
+        print("MBSTOI library available (via alternative path)")
     except ImportError:
-        print("Warning: MBSTOI not available. Install it with proper dependencies.")
+        print("Warning: MBSTOI not available. Install the MBSTOI package for binaural intelligibility metrics.")
         MBSTOI_AVAILABLE = False
 
+# Define constants
+SR = 16000  # Sample rate
+FFT_LEN = 512
+WIN_LEN = 400
+WIN_INC = 100
 
 class Config:
-    fs = 16000  # Default sampling rate
+    fs = SR  # Default sampling rate
 
 CONFIG = Config()
-
 
 def prepare_for_stft(x):
     """Convert 1D array to 3D tensor with shape (batch=1, channel=1, time)"""
     return torch.from_numpy(x).unsqueeze(0).unsqueeze(0)
 
+def extract_snr_from_filename(filename):
+    """Extract SNR value from filename"""
+    # Pattern matching for SNR in filename
+    pattern = r'_snr([+-]\d+)'
+    match = re.search(pattern, filename)
+    if match:
+        return int(match.group(1))
+    return None
+
+def find_files_by_snr(data_dir, snr_level):
+    """Find all .wav files with a specific SNR level in the directory"""
+    files = []
+    
+    # Check if there's an SNR-specific subdirectory
+    snr_dir = os.path.join(data_dir, f"SNR_{snr_level}dB")
+    if os.path.exists(snr_dir):
+        # If SNR directory exists, use all files in it
+        for file in Path(snr_dir).glob("*.wav"):
+            files.append(str(file))
+        print(f"Found {len(files)} files in SNR directory: {snr_dir}")
+        return files
+    
+    # If no SNR directory, search by filename pattern
+    pattern = f"_snr{snr_level:+d}" if snr_level >= 0 else f"_snr{snr_level}"
+    for file in Path(data_dir).rglob("*.wav"):
+        if pattern in file.name:
+            files.append(str(file))
+    
+    print(f"Found {len(files)} files for SNR level {snr_level} dB by filename pattern")
+    return files
+
 def calculate_mbstoi(clean_l, clean_r, proc_l, proc_r):
-    """Unified MBSTOI calculation with error handling"""
+    """Calculate MBSTOI with error handling"""
     if not MBSTOI_AVAILABLE:
-        print("MBSTOI calculation not available, returning 0")
         return 0
     
     try:
@@ -78,15 +121,97 @@ def calculate_mbstoi(clean_l, clean_r, proc_l, proc_r):
         proc_l = proc_l[:min_len]
         proc_r = proc_r[:min_len]
         
-                print(f"[DEBUG] MBSTOI Input Length: clean_l={len(clean_l)}, proc_l={len(proc_l)}")
-        print(f"[DEBUG] MBSTOI RMS: clean_l={np.sqrt(np.mean(clean_l**2)):.4f}, proc_l={np.sqrt(np.mean(proc_l**2)):.4f}")
-        # Call the actual MBSTOI function
+        # Calculate MBSTOI
         result = mbstoi(clean_l, clean_r, proc_l, proc_r)
         return result
     except Exception as e:
-        print(f"Error in MBSTOI calculation: {e}")
+        print(f"Error calculating MBSTOI: {e}")
         return 0
 
+def align_signals(clean, processed, max_delay=64):
+    """Align signals using cross-correlation to compensate for processing delay"""
+    # Ensure same length for correlation
+    min_len = min(len(clean), len(processed))
+    clean_temp = clean[:min_len].copy()
+    processed_temp = processed[:min_len].copy()
+    
+    # Compute cross-correlation
+    corr = np.correlate(clean_temp, processed_temp, mode='full')
+    max_idx = np.argmax(np.abs(corr))
+    center = len(corr) // 2
+    delay = max_idx - center
+    
+    # Limit to max_delay
+    delay = max(min(delay, max_delay), -max_delay)
+    
+    # Apply delay
+    if delay > 0:
+        # processed is delayed
+        clean_aligned = clean_temp[delay:]
+        processed_aligned = processed_temp[:-delay] if delay > 0 else processed_temp
+    else:
+        # clean is delayed
+        clean_aligned = clean_temp[:delay] if delay < 0 else clean_temp
+        processed_aligned = processed_temp[-delay:]
+        
+    # Ensure same length after alignment
+    min_len = min(len(clean_aligned), len(processed_aligned))
+    clean_aligned = clean_aligned[:min_len]
+    processed_aligned = processed_aligned[:min_len]
+    
+    return clean_aligned, processed_aligned
+
+def calculate_fw_seg_snr(clean, processed, frame_size=256, hop=128, fs=16000):
+    """
+    Calculate frequency-weighted Segmental SNR
+    """
+    # Align signals
+    clean_aligned, processed_aligned = align_signals(clean, processed)
+    
+    # Split into frames
+    num_frames = (len(clean_aligned) - frame_size) // hop + 1
+    
+    if num_frames <= 0:
+        return -10  # Return a low value for very short signals
+    
+    # Initialize arrays for snr values
+    seg_snr_values = np.zeros(num_frames)
+    
+    for i in range(num_frames):
+        start = i * hop
+        clean_frame = clean_aligned[start:start+frame_size]
+        proc_frame = processed_aligned[start:start+frame_size]
+        
+        # Calculate noise frame
+        noise_frame = proc_frame - clean_frame
+        
+        # Compute FFT
+        clean_fft = np.fft.rfft(clean_frame * np.hanning(frame_size))
+        noise_fft = np.fft.rfft(noise_frame * np.hanning(frame_size))
+        
+        # Compute power spectrum
+        clean_power = np.abs(clean_fft)**2
+        noise_power = np.abs(noise_fft)**2 + 1e-10  # Avoid division by zero
+        
+        # Calculate critical band frequencies
+        num_crit_bands = 25
+        freq_bands = librosa.filters.mel(sr=fs, n_fft=frame_size, n_mels=num_crit_bands)
+        
+        # Apply frequency weighting
+        clean_power_bands = np.dot(freq_bands, clean_power)
+        noise_power_bands = np.dot(freq_bands, noise_power)
+        
+        # Compute SNR for each band
+        band_snr = 10 * np.log10((clean_power_bands + 1e-10) / (noise_power_bands + 1e-10))
+        
+        # Limit SNR range to [−10, 35] dB as recommended
+        band_snr = np.clip(band_snr, -10, 35)
+        
+        # Average across bands
+        seg_snr_values[i] = np.mean(band_snr)
+    
+    # Return the mean seg SNR
+    return np.mean(seg_snr_values)
 
 def compute_ild_db(s1, s2, eps=1e-6):
     """Compute Interaural Level Difference in dB"""
@@ -95,13 +220,13 @@ def compute_ild_db(s1, s2, eps=1e-6):
     return l1 - l2
 
 def compute_ipd_rad(s1, s2, eps=1e-6):
-    """Compute Interaural Phase Difference in radians correctly"""
+    """Compute Interaural Phase Difference in radians"""
     # Calculate phase difference and wrap to [-π, π]
     phase_diff = np.angle(s1 * np.conj(s2) + eps)
     return phase_diff
 
-def speech_mask(stft_l, stft_r, threshold=40):  # Increased threshold to 40dB
-    """Create a speech binary mask with proper threshold"""
+def speech_mask(stft_l, stft_r, threshold=20):
+    """Create a speech binary mask using the energy level"""
     # Calculate energy (in dB) from both channels
     energy = 10 * np.log10(np.abs(stft_l)**2 + np.abs(stft_r)**2 + 1e-12)
     
@@ -111,13 +236,19 @@ def speech_mask(stft_l, stft_r, threshold=40):  # Increased threshold to 40dB
     # Create mask: select bins above threshold relative to max
     mask = (energy >= max_per_frame - threshold)
     
-    # Print mask statistics for debugging
+    # Ensure we have enough active bins (minimum percentage)
     active_bins = np.sum(mask)
     total_bins = mask.size
-    print(f"Speech mask active bins: {active_bins}/{total_bins} ({active_bins/total_bins:.2%})")
+    active_ratio = active_bins / total_bins
+    
+    if active_ratio < 0.1:  # If less than 10% active, adjust threshold
+        # Sort energies and take top 10%
+        flattened = energy.flatten()
+        sorted_energy = np.sort(flattened)[::-1]  # Sort descending
+        new_threshold = sorted_energy[int(0.1 * total_bins)]
+        mask = (energy >= new_threshold)
     
     return mask
-
 
 def calculate_ild_loss(target_stft_l, target_stft_r, output_stft_l, output_stft_r):
     """Calculate ILD loss between target and output signals"""
@@ -128,11 +259,6 @@ def calculate_ild_loss(target_stft_l, target_stft_r, output_stft_l, output_stft_
     # Create a speech activity mask
     mask = speech_mask(target_stft_l, target_stft_r, threshold=20)
     
-    # Print mask statistics for debugging
-    active_bins = np.sum(mask)
-    total_bins = mask.size
-    print(f"Speech mask active bins: {active_bins}/{total_bins} ({active_bins/total_bins:.2%})")
-    
     # Calculate the absolute difference and apply mask
     ild_error = np.abs(target_ild - output_ild)
     masked_ild_error = ild_error * mask
@@ -141,9 +267,7 @@ def calculate_ild_loss(target_stft_l, target_stft_r, output_stft_l, output_stft_
     if np.sum(mask) > 0:
         return np.sum(masked_ild_error) / np.sum(mask)
     else:
-        print("Warning: Empty speech mask in ILD calculation")
         return np.mean(ild_error)  # Fallback to all TF bins
-
 
 def calculate_ipd_loss(target_stft_l, target_stft_r, output_stft_l, output_stft_r):
     """Calculate IPD loss between target and output signals in degrees"""
@@ -165,743 +289,601 @@ def calculate_ipd_loss(target_stft_l, target_stft_r, output_stft_l, output_stft_
     else:
         return 0
 
+def evaluate_file_pair(model, clean_path, noisy_path, device):
+    """Evaluate a single pair of clean and noisy files"""
+    try:
+        # Load audio files
+        clean, sr_clean = sf.read(clean_path)
+        noisy, sr_noisy = sf.read(noisy_path)
+        
+        # Ensure correct shape (should be [samples, 2] for stereo)
+        if clean.ndim == 1:
+            print(f"Warning: {clean_path} is mono, expected stereo")
+            return None
+        if noisy.ndim == 1:
+            print(f"Warning: {noisy_path} is mono, expected stereo")
+            return None
+        
+        # Transpose if needed
+        if clean.shape[1] != 2:
+            clean = clean.T
+        if noisy.shape[1] != 2:
+            noisy = noisy.T
+        
+        # Convert to correct format for model
+        noisy_tensor = torch.from_numpy(noisy.T).float().unsqueeze(0).to(device)
+        
+        # Process with model
+        with torch.no_grad():
+            enhanced_tensor = model(noisy_tensor).cpu()
+        
+        # Convert back to numpy
+        enhanced = enhanced_tensor[0].numpy().T
+        
+        # Extract channels
+        clean_l, clean_r = clean[:, 0], clean[:, 1]
+        noisy_l, noisy_r = noisy[:, 0], noisy[:, 1]
+        enhanced_l, enhanced_r = enhanced[:, 0], enhanced[:, 1]
+        
+        # Initialize audio processing tools
+        stft = Stft(n_dft=FFT_LEN, hop_size=WIN_INC, win_length=WIN_LEN)
+        stoi_metric = ShortTimeObjectiveIntelligibility(fs=SR)
+        
+        # Align signals for fair comparison
+        clean_l_n, noisy_l = align_signals(clean_l, noisy_l)
+        clean_r_n, noisy_r = align_signals(clean_r, noisy_r)
+        clean_l_e, enhanced_l = align_signals(clean_l, enhanced_l)
+        clean_r_e, enhanced_r = align_signals(clean_r, enhanced_r)
+        
+        # Calculate metrics
+        # 1. SegSNR
+        snr_noisy_l = calculate_fw_seg_snr(clean_l_n, noisy_l, fs=SR)
+        snr_noisy_r = calculate_fw_seg_snr(clean_r_n, noisy_r, fs=SR)
+        snr_enhanced_l = calculate_fw_seg_snr(clean_l_e, enhanced_l, fs=SR)
+        snr_enhanced_r = calculate_fw_seg_snr(clean_r_e, enhanced_r, fs=SR)
+        
+        # 2. STOI
+        stoi_noisy_l = stoi_metric(torch.from_numpy(clean_l_n), torch.from_numpy(noisy_l)).item()
+        stoi_noisy_r = stoi_metric(torch.from_numpy(clean_r_n), torch.from_numpy(noisy_r)).item()
+        stoi_enhanced_l = stoi_metric(torch.from_numpy(clean_l_e), torch.from_numpy(enhanced_l)).item()
+        stoi_enhanced_r = stoi_metric(torch.from_numpy(clean_r_e), torch.from_numpy(enhanced_r)).item()
+        
+        # 3. MBSTOI
+        mbstoi_noisy = calculate_mbstoi(clean_l_n, clean_r_n, noisy_l, noisy_r) if MBSTOI_AVAILABLE else 0
+        mbstoi_enhanced = calculate_mbstoi(clean_l_e, clean_r_e, enhanced_l, enhanced_r) if MBSTOI_AVAILABLE else 0
+        
+        # Apply STFT for interaural cues
+        noisy_stft_l = stft(prepare_for_stft(noisy_l)).squeeze(0).numpy()
+        noisy_stft_r = stft(prepare_for_stft(noisy_r)).squeeze(0).numpy()
+        enhanced_stft_l = stft(prepare_for_stft(enhanced_l)).squeeze(0).numpy()
+        enhanced_stft_r = stft(prepare_for_stft(enhanced_r)).squeeze(0).numpy()
+        clean_stft_l = stft(prepare_for_stft(clean_l_n)).squeeze(0).numpy()
+        clean_stft_r = stft(prepare_for_stft(clean_r_n)).squeeze(0).numpy()
+        
+        # 4. Calculate ILD and IPD errors
+        ild_error = calculate_ild_loss(clean_stft_l, clean_stft_r, enhanced_stft_l, enhanced_stft_r)
+        ipd_error = calculate_ipd_loss(clean_stft_l, clean_stft_r, enhanced_stft_l, enhanced_stft_r)
+        
+        # Return all metrics
+        return {
+            'stoi_noisy_l': stoi_noisy_l, 
+            'stoi_noisy_r': stoi_noisy_r,
+            'stoi_enhanced_l': stoi_enhanced_l, 
+            'stoi_enhanced_r': stoi_enhanced_r,
+            'mbstoi_noisy': mbstoi_noisy,
+            'mbstoi_enhanced': mbstoi_enhanced,
+            'snr_noisy_l': snr_noisy_l, 
+            'snr_noisy_r': snr_noisy_r,
+            'snr_enhanced_l': snr_enhanced_l, 
+            'snr_enhanced_r': snr_enhanced_r,
+            'ild_error': ild_error,
+            'ipd_error': ipd_error,
+            # Add file paths for reference
+            'clean_path': clean_path,
+            'noisy_path': noisy_path,
+            # Add audio for optional saving
+            'clean_audio': clean,
+            'noisy_audio': noisy,
+            'enhanced_audio': enhanced
+        }
+    except Exception as e:
+        print(f"Error processing file pair {clean_path} and {noisy_path}: {e}")
+        return None
 
-def calculate_snr(clean, processed, max_delay=64):  # Increased from 10 to 64
-    """Calculate Signal-to-Noise Ratio in dB with proper alignment"""
-#     # Ensure same length
-    min_len = min(len(clean), len(processed))
-    clean_temp = clean[:min_len].copy()
-    processed_temp = processed[:min_len].copy()
+def find_matching_clean_file(noisy_path, clean_dir):
+    """Find the matching clean file for a noisy file"""
+    noisy_name = os.path.basename(noisy_path)
     
-#     # Find optimal alignment using cross-correlation
-    if max_delay > 0:
-#         # Compute cross-correlation
-        corr = np.correlate(clean_temp, processed_temp, mode='full')
-        max_idx = np.argmax(np.abs(corr))
-        center = len(corr) // 2
-        delay = max_idx - center
+    # Extract SNR level from filename to look in the right SNR directory
+    snr_level = extract_snr_from_filename(noisy_name)
+    
+    # Check if clean directory has SNR-specific subdirectories
+    snr_specific_dir = None
+    if snr_level is not None:
+        possible_snr_dirs = [
+            os.path.join(clean_dir, f"SNR_{snr_level}dB"),
+            os.path.join(clean_dir, f"SNR_{snr_level:+d}dB")
+        ]
+        for dir_path in possible_snr_dirs:
+            if os.path.exists(dir_path):
+                snr_specific_dir = dir_path
+                break
+    
+    # Search paths in order of likelihood
+    search_paths = [clean_dir]  # Default: root clean directory
+    if snr_specific_dir:
+        search_paths.insert(0, snr_specific_dir)  # First try SNR-specific directory
+    
+    # Try exact filename match in each search path
+    for search_path in search_paths:
+        clean_path = os.path.join(search_path, noisy_name)
+        if os.path.exists(clean_path):
+            return clean_path
         
-#         # Limit to max_delay
-        delay = max(min(delay, max_delay), -max_delay)
+        # Try common variations of the name
+        clean_name = noisy_name.replace("noisy_", "")
+        variations = [
+            clean_name,
+            "clean_" + clean_name,
+            noisy_name.replace("noisy", "clean")
+        ]
         
-#         # Apply delay
-        if delay > 0:
-#             # processed is delayed
-            clean = clean_temp[delay:]
-            processed = processed_temp[:-delay] if delay > 0 else processed_temp
-        else:
-#             # clean is delayed
-            clean = clean_temp[:delay] if delay < 0 else clean_temp
-            processed = processed_temp[-delay:]
+        for name in variations:
+            path = os.path.join(search_path, name)
+            if os.path.exists(path):
+                return path
+    
+    # If no exact match, search for files with similar identifiers
+    # Extract unique identifiers from noisy filename (like speaker, utterance IDs)
+    if snr_level is not None:
+        parts = noisy_name.split('_')
+        # Get the base pattern (usually speaker and utterance IDs)
+        base_pattern = parts[0]
+        if len(parts) > 1:
+            base_pattern += "_" + parts[1]
             
-#         # Ensure same length after alignment
-        min_len = min(len(clean), len(processed))
-        clean = clean[:min_len]
-        processed = processed[:min_len]
-    else:
-        clean = clean_temp
-#         processed = processed_temp
+        # Look in SNR-specific directory first if it exists
+        if snr_specific_dir:
+            for file in os.listdir(snr_specific_dir):
+                if base_pattern in file:
+                    return os.path.join(snr_specific_dir, file)
+        
+        # Try the main clean directory if SNR-specific search failed
+        for file in os.listdir(clean_dir):
+            if base_pattern in file:
+                return os.path.join(clean_dir, file)
     
-#     # Calculate energy of clean signal
-#     clean_energy = np.sum(clean**2) + 1e-10
-    
-#     # Calculate MSE between clean and processed
-#     noise = processed - clean
-#     noise_energy = np.sum(noise**2) + 1e-10
-    
-#     # Calculate SNR
-#     snr = 10 * np.log10(clean_energy / noise_energy)
-    
-#     # Cap extreme SNRs
-#     return max(min(snr, 30), -30)
+    print(f"Warning: No matching clean file found for {noisy_path}")
+    return None
 
-def calculate_seg_snr(clean, processed, frame_size=256, hop=128, max_delay=64):
-    """Calculate frequency-weighted Segmental SNR"""
-    # Align signals first
-    min_len = min(len(clean), len(processed))
-    clean_temp = clean[:min_len].copy()
-    processed_temp = processed[:min_len].copy()
+def evaluate_snr_level(model, clean_dir, noisy_dir, snr_level, device, num_samples=50, save_audio=False, output_dir=None):
+    """Evaluate model performance on a specific SNR level"""
+    print(f"\n{'='*50}")
+    print(f"Evaluating at SNR level: {snr_level} dB")
+    print(f"{'='*50}")
     
-    # Find optimal alignment using cross-correlation
-    corr = np.correlate(clean_temp, processed_temp, mode='full')
-    max_idx = np.argmax(np.abs(corr))
-    center = len(corr) // 2
-    delay = max_idx - center
+    # Find files matching the SNR level
+    noisy_files = find_files_by_snr(noisy_dir, snr_level)
     
-    # Limit to max_delay
-    delay = max(min(delay, max_delay), -max_delay)
+    if not noisy_files:
+        print(f"No files found for SNR level {snr_level} dB. Skipping.")
+        return None
     
-    # Apply delay
-    if delay > 0:
-        clean_aligned = clean_temp[delay:]
-        processed_aligned = processed_temp[:-delay] if delay > 0 else processed_temp
-    else:
-        clean_aligned = clean_temp[:delay] if delay < 0 else clean_temp
-        processed_aligned = processed_temp[-delay:]
+    # If we have more files than needed, randomly sample
+    if len(noisy_files) > num_samples:
+        np.random.shuffle(noisy_files)
+        noisy_files = noisy_files[:num_samples]
+    
+    # Results for this SNR level
+    results = []
+    
+    # Process each file
+    for i, noisy_path in enumerate(tqdm(noisy_files, desc=f"Processing SNR {snr_level} dB")):
+        # Find matching clean file
+        clean_path = find_matching_clean_file(noisy_path, clean_dir)
         
-    # Ensure same length after alignment
-    min_len = min(len(clean_aligned), len(processed_aligned))
-    clean_aligned = clean_aligned[:min_len]
-    processed_aligned = processed_aligned[:min_len]
-    
-    # Split into frames
-    num_frames = (min_len - frame_size) // hop + 1
-    seg_snrs = []
-    
-    for i in range(num_frames):
-        start = i * hop
-        clean_frame = clean_aligned[start:start+frame_size]
-        proc_frame = processed_aligned[start:start+frame_size]
+        if not clean_path:
+            continue
         
-        # Calculate frame energy and noise energy
-        clean_energy = np.sum(clean_frame**2) + 1e-10
-        noise = proc_frame - clean_frame
-        noise_energy = np.sum(noise**2) + 1e-10
+        # Evaluate the pair
+        metrics = evaluate_file_pair(model, clean_path, noisy_path, device)
         
-        # Calculate SNR for this frame
-        frame_snr = 10 * np.log10(clean_energy / noise_energy)
-        
-        # Cap extreme values
-        frame_snr = max(min(frame_snr, 35), -10)
-        seg_snrs.append(frame_snr)
-    
-    # Return average and aligned signals
-    return np.mean(seg_snrs), clean_aligned, processed_aligned
-
-def calculate_snr_and_align(clean, processed, max_delay=64):
-    """Calculate SNR and return aligned signals"""
-    # Ensure same length
-    min_len = min(len(clean), len(processed))
-    clean_temp = clean[:min_len].copy()
-    processed_temp = processed[:min_len].copy()
-    
-    # Find optimal alignment using cross-correlation
-    if max_delay > 0:
-        # Compute cross-correlation
-        corr = np.correlate(clean_temp, processed_temp, mode='full')
-        max_idx = np.argmax(np.abs(corr))
-        center = len(corr) // 2
-        delay = max_idx - center
-        
-        # Limit to max_delay
-        delay = max(min(delay, max_delay), -max_delay)
-        
-        # Apply delay
-        if delay > 0:
-            # processed is delayed
-            clean_aligned = clean_temp[delay:]
-            processed_aligned = processed_temp[:-delay] if delay > 0 else processed_temp
-        else:
-            # clean is delayed
-            clean_aligned = clean_temp[:delay] if delay < 0 else clean_temp
-            processed_aligned = processed_temp[-delay:]
+        if metrics:
+            results.append(metrics)
             
-        # Ensure same length after alignment
-        min_len = min(len(clean_aligned), len(processed_aligned))
-        clean_aligned = clean_aligned[:min_len]
-        processed_aligned = processed_aligned[:min_len]
-    else:
-        clean_aligned = clean_temp
-        processed_aligned = processed_temp
+            # Save a few audio samples if requested
+            if save_audio and output_dir and i < 5:  # Save first 5 samples
+                sample_dir = os.path.join(output_dir, f"snr_{snr_level}dB_sample_{i}")
+                os.makedirs(sample_dir, exist_ok=True)
+                
+                # Save audio files
+                sf.write(os.path.join(sample_dir, "clean_L.wav"), metrics['clean_audio'][:, 0], SR)
+                sf.write(os.path.join(sample_dir, "clean_R.wav"), metrics['clean_audio'][:, 1], SR)
+                sf.write(os.path.join(sample_dir, "noisy_L.wav"), metrics['noisy_audio'][:, 0], SR)
+                sf.write(os.path.join(sample_dir, "noisy_R.wav"), metrics['noisy_audio'][:, 1], SR)
+                sf.write(os.path.join(sample_dir, "enhanced_L.wav"), metrics['enhanced_audio'][:, 0], SR)
+                sf.write(os.path.join(sample_dir, "enhanced_R.wav"), metrics['enhanced_audio'][:, 1], SR)
     
-    # Calculate energy of clean signal
-    clean_energy = np.sum(clean_aligned**2) + 1e-10
+    if not results:
+        print(f"No valid results for SNR level {snr_level} dB. Skipping.")
+        return None
     
-    # Calculate MSE between clean and processed
-    noise = processed_aligned - clean_aligned
-    noise_energy = np.sum(noise**2) + 1e-10
+    # Calculate average metrics
+    avg_metrics = {}
+    for key in results[0].keys():
+        if key not in ['clean_path', 'noisy_path', 'clean_audio', 'noisy_audio', 'enhanced_audio']:
+            avg_metrics[key] = np.mean([r[key] for r in results])
     
-    # Calculate SNR
-    snr = 10 * np.log10(clean_energy / noise_energy)
+    # Calculate derived metrics
+    avg_metrics['stoi_improvement_l'] = avg_metrics['stoi_enhanced_l'] - avg_metrics['stoi_noisy_l']
+    avg_metrics['stoi_improvement_r'] = avg_metrics['stoi_enhanced_r'] - avg_metrics['stoi_noisy_r']
+    avg_metrics['mbstoi_improvement'] = avg_metrics['mbstoi_enhanced'] - avg_metrics['mbstoi_noisy']
+    avg_metrics['snr_improvement_l'] = avg_metrics['snr_enhanced_l'] - avg_metrics['snr_noisy_l']
+    avg_metrics['snr_improvement_r'] = avg_metrics['snr_enhanced_r'] - avg_metrics['snr_noisy_r']
     
-    # Cap extreme SNRs
-    snr = max(min(snr, 30), -30)
+    # Print metrics
+    print(f"\nResults for SNR level {snr_level} dB (average over {len(results)} files):")
+    print(f"STOI Improvement (L/R): {avg_metrics['stoi_improvement_l']:.3f}/{avg_metrics['stoi_improvement_r']:.3f}")
+    if MBSTOI_AVAILABLE:
+        print(f"MBSTOI Improvement: {avg_metrics['mbstoi_improvement']:.3f}")
+    print(f"SegSNR Improvement (L/R): {avg_metrics['snr_improvement_l']:.2f}/{avg_metrics['snr_improvement_r']:.2f} dB")
+    print(f"ILD Error: {avg_metrics['ild_error']:.2f} dB")
+    print(f"IPD Error: {avg_metrics['ipd_error']:.2f} degrees")
     
-    return snr, clean_aligned, processed_aligned
+    # Save detailed metrics if output directory is provided
+    if output_dir:
+        snr_dir = os.path.join(output_dir, f"snr_{snr_level}dB")
+        os.makedirs(snr_dir, exist_ok=True)
+        
+        # Save summary metrics to CSV
+        metrics_df = pd.DataFrame({
+            'Metric': [
+                'STOI Noisy (L)', 'STOI Enhanced (L)', 'STOI Improvement (L)',
+                'STOI Noisy (R)', 'STOI Enhanced (R)', 'STOI Improvement (R)',
+                'MBSTOI Noisy', 'MBSTOI Enhanced', 'MBSTOI Improvement',
+                'SegSNR Noisy (L)', 'SegSNR Enhanced (L)', 'SegSNR Improvement (L)',
+                'SegSNR Noisy (R)', 'SegSNR Enhanced (R)', 'SegSNR Improvement (R)',
+                'ILD Error', 'IPD Error'
+            ],
+            'Value': [
+                avg_metrics['stoi_noisy_l'], avg_metrics['stoi_enhanced_l'], avg_metrics['stoi_improvement_l'],
+                avg_metrics['stoi_noisy_r'], avg_metrics['stoi_enhanced_r'], avg_metrics['stoi_improvement_r'],
+                avg_metrics['mbstoi_noisy'], avg_metrics['mbstoi_enhanced'], avg_metrics['mbstoi_improvement'],
+                avg_metrics['snr_noisy_l'], avg_metrics['snr_enhanced_l'], avg_metrics['snr_improvement_l'],
+                avg_metrics['snr_noisy_r'], avg_metrics['snr_enhanced_r'], avg_metrics['snr_improvement_r'],
+                avg_metrics['ild_error'], avg_metrics['ipd_error']
+            ]
+        })
+        metrics_df.to_csv(os.path.join(snr_dir, "metrics.csv"), index=False)
+        
+        # Save raw results for further analysis
+        raw_data = [{k: v for k, v in r.items() if k not in ['clean_audio', 'noisy_audio', 'enhanced_audio']} 
+                    for r in results]
+        raw_df = pd.DataFrame(raw_data)
+        raw_df.to_csv(os.path.join(snr_dir, "raw_results.csv"), index=False)
+    
+    return {
+        'snr_level': snr_level,
+        'metrics': avg_metrics,
+        'num_samples': len(results)
+    }
 
-def evaluate_model(config_path="./config", 
-                  model_checkpoint_path=None,
-                  noisy_dataset_path=None, 
-                  clean_dataset_path=None,
-                  output_dir="evaluation_results", 
-                  num_samples=100):
-    """
-    Comprehensive evaluation of the binaural speech enhancement model with multiple metrics
+def plot_metrics_by_snr(all_results, output_dir):
+    """Create visualizations for metrics across SNR levels"""
+    if not all_results:
+        print("No results to plot")
+        return
     
-    Args:
-        config_path: Path to the config directory
-        model_checkpoint_path: Path to the saved model checkpoint
-        noisy_dataset_path: Path to noisy test dataset, if None uses config value
-        clean_dataset_path: Path to clean test dataset, if None uses config value 
-        output_dir: Directory to save visualizations and results
-        num_samples: Number of samples to evaluate
-    """
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+    # Extract data for plotting
+    snr_levels = [r['snr_level'] for r in all_results]
+    indices = np.argsort(snr_levels)
+    snr_levels = [snr_levels[i] for i in indices]
+    
+    # Extract metrics for each dimension
+    get_metric = lambda key: [all_results[i]['metrics'][key] for i in indices]
+    
+    # STOI Improvement
+    plt.figure(figsize=(10, 6))
+    plt.plot(snr_levels, get_metric('stoi_improvement_l'), 'o-', label='Left Channel')
+    plt.plot(snr_levels, get_metric('stoi_improvement_r'), 'o-', label='Right Channel')
+    plt.xlabel('SNR Level (dB)')
+    plt.ylabel('STOI Improvement')
+    plt.title('STOI Improvement by SNR Level')
+    plt.grid(True)
+    plt.legend()
+    plt.savefig(os.path.join(output_dir, "stoi_improvement.png"))
+    plt.close()
+    
+    # MBSTOI Improvement
+    if MBSTOI_AVAILABLE:
+        plt.figure(figsize=(10, 6))
+        plt.plot(snr_levels, get_metric('mbstoi_improvement'), 'o-')
+        plt.xlabel('SNR Level (dB)')
+        plt.ylabel('MBSTOI Improvement')
+        plt.title('MBSTOI Improvement by SNR Level')
+        plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "mbstoi_improvement.png"))
+        plt.close()
+    
+    # SegSNR Improvement
+    plt.figure(figsize=(10, 6))
+    plt.plot(snr_levels, get_metric('snr_improvement_l'), 'o-', label='Left Channel')
+    plt.plot(snr_levels, get_metric('snr_improvement_r'), 'o-', label='Right Channel')
+    plt.xlabel('SNR Level (dB)')
+    plt.ylabel('SegSNR Improvement (dB)')
+    plt.title('SegSNR Improvement by SNR Level')
+    plt.grid(True)
+    plt.legend()
+    plt.savefig(os.path.join(output_dir, "segsnr_improvement.png"))
+    plt.close()
+    
+    # Interaural Cue Preservation
+    plt.figure(figsize=(10, 6))
+    plt.plot(snr_levels, get_metric('ild_error'), 'o-', label='ILD Error (dB)')
+    plt.plot(snr_levels, [e/10 for e in get_metric('ipd_error')], 'o-', label='IPD Error (° ÷ 10)')
+    plt.xlabel('SNR Level (dB)')
+    plt.ylabel('Error')
+    plt.title('Interaural Cue Preservation by SNR Level')
+    plt.grid(True)
+    plt.legend()
+    plt.savefig(os.path.join(output_dir, "interaural_errors.png"))
+    plt.close()
+    
+    # Combined metrics overview
+    plt.figure(figsize=(15, 10))
+    
+    # SegSNR subplot
+    plt.subplot(2, 2, 1)
+    plt.plot(snr_levels, get_metric('snr_improvement_l'), 'o-', label='Left Channel')
+    plt.plot(snr_levels, get_metric('snr_improvement_r'), 'o-', label='Right Channel')
+    plt.xlabel('SNR Level (dB)')
+    plt.ylabel('SegSNR Improvement (dB)')
+    plt.title('Noise Reduction Performance')
+    plt.grid(True)
+    plt.legend()
+    
+    # STOI subplot
+    plt.subplot(2, 2, 2)
+    plt.plot(snr_levels, get_metric('stoi_improvement_l'), 'o-', label='Left Channel')
+    plt.plot(snr_levels, get_metric('stoi_improvement_r'), 'o-', label='Right Channel')
+    plt.xlabel('SNR Level (dB)')
+    plt.ylabel('STOI Improvement')
+    plt.title('Speech Intelligibility Improvement')
+    plt.grid(True)
+    plt.legend()
+    
+    # MBSTOI subplot
+    plt.subplot(2, 2, 3)
+    if MBSTOI_AVAILABLE:
+        plt.plot(snr_levels, get_metric('mbstoi_improvement'), 'o-')
+        plt.xlabel('SNR Level (dB)')
+        plt.ylabel('MBSTOI Improvement')
+        plt.title('Binaural Speech Intelligibility')
+        plt.grid(True)
+    else:
+        plt.text(0.5, 0.5, 'MBSTOI not available', 
+                 horizontalalignment='center', verticalalignment='center')
+        plt.axis('off')
+    
+    # Interaural Cues subplot
+    plt.subplot(2, 2, 4)
+    plt.plot(snr_levels, get_metric('ild_error'), 'o-', label='ILD Error (dB)')
+    plt.plot(snr_levels, [e/10 for e in get_metric('ipd_error')], 'o-', label='IPD Error (° ÷ 10)')
+    plt.xlabel('SNR Level (dB)')
+    plt.ylabel('Error')
+    plt.title('Interaural Cue Preservation')
+    plt.grid(True)
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "metrics_overview.png"))
+    plt.close()
+    
+def create_summary_report(all_results, output_dir):
+    """Create a markdown report summarizing all results"""
+    if not all_results:
+        print("No results to include in report")
+        return
+    
+    # Sort results by SNR level
+    all_results.sort(key=lambda r: r['snr_level'])
+    
+    with open(os.path.join(output_dir, "summary_report.md"), 'w') as f:
+        f.write("# Binaural Speech Enhancement Evaluation Results\n\n")
+        
+        f.write("## Overview\n")
+        f.write("This report summarizes the performance of the BCCTN model across different SNR levels.\n\n")
+        
+        # STOI Table
+        f.write("## Speech Intelligibility (STOI)\n\n")
+        f.write("| SNR (dB) | Noisy (L) | Enhanced (L) | Improvement (L) | Noisy (R) | Enhanced (R) | Improvement (R) |\n")
+        f.write("|----------|-----------|--------------|-----------------|-----------|--------------|------------------|\n")
+        
+        for result in all_results:
+            metrics = result['metrics']
+            snr = result['snr_level']
+            
+            f.write(f"| {snr} | {metrics['stoi_noisy_l']:.3f} | {metrics['stoi_enhanced_l']:.3f} | ")
+            f.write(f"**{metrics['stoi_improvement_l']:.3f}** | {metrics['stoi_noisy_r']:.3f} | ")
+            f.write(f"{metrics['stoi_enhanced_r']:.3f} | **{metrics['stoi_improvement_r']:.3f}** |\n")
+        
+        # MBSTOI Table
+        if MBSTOI_AVAILABLE:
+            f.write("\n## Binaural Speech Intelligibility (MBSTOI)\n\n")
+            f.write("| SNR (dB) | Noisy | Enhanced | Improvement |\n")
+            f.write("|----------|-------|----------|-------------|\n")
+            
+            for result in all_results:
+                metrics = result['metrics']
+                snr = result['snr_level']
+                
+                f.write(f"| {snr} | {metrics['mbstoi_noisy']:.3f} | {metrics['mbstoi_enhanced']:.3f} | ")
+                f.write(f"**{metrics['mbstoi_improvement']:.3f}** |\n")
+        
+        # SegSNR Table
+        f.write("\n## Noise Reduction (SegSNR in dB)\n\n")
+        f.write("| SNR (dB) | Noisy (L) | Enhanced (L) | Improvement (L) | Noisy (R) | Enhanced (R) | Improvement (R) |\n")
+        f.write("|----------|-----------|--------------|-----------------|-----------|--------------|------------------|\n")
+        
+        for result in all_results:
+            metrics = result['metrics']
+            snr = result['snr_level']
+            
+            f.write(f"| {snr} | {metrics['snr_noisy_l']:.2f} | {metrics['snr_enhanced_l']:.2f} | ")
+            f.write(f"**{metrics['snr_improvement_l']:.2f}** | {metrics['snr_noisy_r']:.2f} | ")
+            f.write(f"{metrics['snr_enhanced_r']:.2f} | **{metrics['snr_improvement_r']:.2f}** |\n")
+        
+        # Interaural Cues Table
+        f.write("\n## Interaural Cue Preservation\n\n")
+        f.write("| SNR (dB) | ILD Error (dB) | IPD Error (°) |\n")
+        f.write("|----------|----------------|---------------|\n")
+        
+        for result in all_results:
+            metrics = result['metrics']
+            snr = result['snr_level']
+            
+            f.write(f"| {snr} | {metrics['ild_error']:.2f} | {metrics['ipd_error']:.2f} |\n")
+        
+        # Add visualizations to the report
+        f.write("\n## Visualizations\n\n")
+        f.write("### Overall Performance Metrics\n")
+        f.write("![Metrics Overview](metrics_overview.png)\n\n")
+        
+        f.write("### SegSNR Improvement\n")
+        f.write("![SegSNR Improvement](segsnr_improvement.png)\n\n")
+        
+        f.write("### STOI Improvement\n")
+        f.write("![STOI Improvement](stoi_improvement.png)\n\n")
+        
+        if MBSTOI_AVAILABLE:
+            f.write("### MBSTOI Improvement\n")
+            f.write("![MBSTOI Improvement](mbstoi_improvement.png)\n\n")
+        
+        f.write("### Interaural Cue Preservation\n")
+        f.write("![Interaural Errors](interaural_errors.png)\n")
+
+def main():
+    """Main function to run the evaluation"""
+    parser = argparse.ArgumentParser(description="Evaluate BCCTN model on different SNR levels")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument("--data_root", type=str, required=True, help="Root directory containing clean and noisy data")
+    parser.add_argument("--clean_dir", type=str, help="Directory containing clean data (defaults to data_root/clean)")
+    parser.add_argument("--noisy_dir", type=str, help="Directory containing noisy data (defaults to data_root/noisy)")
+    parser.add_argument("--output_dir", type=str, default="evaluation_results", help="Directory to save results")
+    parser.add_argument("--config_path", type=str, default="./config", help="Path to Hydra config directory")
+    parser.add_argument("--num_samples", type=int, default=50, help="Number of samples to evaluate per SNR level")
+    parser.add_argument("--snr_levels", type=int, nargs="+", default=[-6, -3, 0, 3, 6, 9, 12, 15], 
+                      help="SNR levels to evaluate (default: -6 -3 0 3 6 9 12 15)")
+    parser.add_argument("--save_audio", action="store_true", help="Save audio samples for each SNR level")
+    
+    args = parser.parse_args()
     
     # Initialize Hydra config
     GlobalHydra.instance().clear()
-    initialize(config_path=config_path)
+    initialize(config_path=args.config_path)
     config = compose("config")
     
-    # If paths not provided, use from config
-    if noisy_dataset_path is None:
-        noisy_dataset_path = config.dataset.noisy_test_dataset_dir
-    if clean_dataset_path is None:
-        clean_dataset_path = config.dataset.target_test_dataset_dir
+    # Set up directories
+    if not args.clean_dir:
+        args.clean_dir = os.path.join(args.data_root, "clean")
+    if not args.noisy_dir:
+        args.noisy_dir = os.path.join(args.data_root, "noisy")
     
-    # If model_checkpoint_path not provided, use default
-    if model_checkpoint_path is None:
-        model_checkpoint_path = "DCNN/Checkpoints/Trained_model.ckpt"
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    # Check if paths exist
-    for path in [noisy_dataset_path, clean_dataset_path, model_checkpoint_path]:
+    # Check if directories exist
+    for path in [args.clean_dir, args.noisy_dir, args.checkpoint]:
         if not os.path.exists(path):
             print(f"Error: Path {path} does not exist.")
             return
     
-    print(f"Loading model from {model_checkpoint_path}")
+    # Set up device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Initialize model
+    # Load model
+    print(f"Loading model from {args.checkpoint}")
     model = DCNNLightningModule(config)
     model.eval()
-    torch.cuda.empty_cache()  # Clear CUDA cache between samples
-
-    # Load checkpoint with modified state dict handling
-    checkpoint = torch.load(model_checkpoint_path, map_location=device)
+    
+    # Load checkpoint
+    checkpoint = torch.load(args.checkpoint, map_location=device)
     
     # Get state dict and check for needed modifications
     state_dict = checkpoint["state_dict"]
     
     # Check if model prefix needs to be added
-    # The loaded state dict has keys without 'model.' prefix, but the model expects them with it
     if all(not k.startswith("model.") for k in state_dict.keys()):
-        # Instead of stripping "model." prefix, we need to add it
+        # Add model. prefix
         state_dict = {"model." + k: v for k, v in state_dict.items()}
     
     # Now load with strict=False to allow for some flexibility
     model.load_state_dict(state_dict, strict=False)
-    
-    # Alternatively, if you're sure the structure is right but just prefixes are wrong:
-    # model.model.load_state_dict(checkpoint["state_dict"], strict=False)
-    
     model = model.to(device)
-
-    # # Alternative approach
-    # model = DCNNLightningModule(config)
-    # checkpoint = torch.load(model_checkpoint_path, map_location=device)
-    # model.model.load_state_dict(checkpoint["state_dict"], strict=False)
-    # model = model.to(device)
     
-    print(f"Model loaded successfully. Starting evaluation on {num_samples} samples...")
+    print(f"Model loaded successfully")
     
-    # Initialize audio processing tools
-    SR = 16000  # Sample rate
-    win_len = 400
-    win_inc = 100
-    fft_len = 512
+    # Evaluate each SNR level
+    all_results = []
+    for snr_level in args.snr_levels:
+        result = evaluate_snr_level(
+            model, args.clean_dir, args.noisy_dir, snr_level, 
+            device, args.num_samples, args.save_audio, args.output_dir
+        )
+        if result:
+            all_results.append(result)
     
-    stft = Stft(n_dft=fft_len, hop_size=win_inc, win_length=win_len)
-    istft = IStft(n_dft=fft_len, hop_size=win_inc, win_length=win_len)
-    stoi_metric = ShortTimeObjectiveIntelligibility(fs=SR)
-    
-    # Create dataset and dataloader
-    dataset = BaseDataset(noisy_dataset_path, clean_dataset_path, mono=False)
-    # dataloader = torch.utils.data.DataLoader(
-    #     dataset,
-    #     batch_size=1,
-    #     shuffle=True,
-    #     pin_memory=True,
-    #     drop_last=False,
-    #     num_workers=2
-    # )
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=1,  # Keep batch size at 1 for evaluation
-        shuffle=True,
-        pin_memory=True,
-        drop_last=False,
-        num_workers=1  # Reduce worker count to avoid memory issues
-    )
-    
-    # Initialize metrics storage
-    metrics = {
-        'stoi_noisy_l': [],
-        'stoi_noisy_r': [],
-        'stoi_enhanced_l': [],
-        'stoi_enhanced_r': [],
-        'mbstoi_noisy': [],
-        'mbstoi_enhanced': [],
-        'pesq_noisy_l': [],
-        'pesq_noisy_r': [],
-        'pesq_enhanced_l': [],
-        'pesq_enhanced_r': [],
-        'snr_noisy_l': [],
-        'snr_noisy_r': [],
-        'snr_enhanced_l': [],
-        'snr_enhanced_r': [],
-        'ild_error': [],
-        'ipd_error': []
-    }
-    
-    # with torch.no_grad():
-    #     for i, batch in enumerate(tqdm(dataloader, total=num_samples)):
-    #         if i >= num_samples:
-    #             break
-                
-    #         # Get data
-    #         noisy_samples = batch[0].to(device)
-    #         clean_samples = batch[1].to(device)
-            
-    #         # Process with model
-    #         model_output = model(noisy_samples).cpu()
-            
-    #         # Move tensors to CPU for analysis
-    #         noisy_samples = noisy_samples.cpu()
-    #         clean_samples = clean_samples.cpu()
-            
-    #         # Convert to numpy for easier processing
-    #         noisy_np = noisy_samples[0].numpy()
-    #         clean_np = clean_samples[0].numpy()
-    #         enhanced_np = model_output[0].numpy()
-            
-    #         # # Calculate STOI
-    #         # metrics['stoi_noisy_l'].append(stoi_metric(torch.from_numpy(noisy_np[0]), torch.from_numpy(clean_np[0])).item())
-    #         # metrics['stoi_noisy_r'].append(stoi_metric(torch.from_numpy(noisy_np[1]), torch.from_numpy(clean_np[1])).item())
-    #         # metrics['stoi_enhanced_l'].append(stoi_metric(torch.from_numpy(enhanced_np[0]), torch.from_numpy(clean_np[0])).item())
-    #         # metrics['stoi_enhanced_r'].append(stoi_metric(torch.from_numpy(enhanced_np[1]), torch.from_numpy(clean_np[1])).item())
-
-    #         # Calculate SNR for noisy signals and keep aligned versions
-    #         snr_noisy_l, clean_aligned_noisy_l, noisy_aligned_l = calculate_snr_and_align(clean_np[0], noisy_np[0])
-    #         snr_noisy_r, clean_aligned_noisy_r, noisy_aligned_r = calculate_snr_and_align(clean_np[1], noisy_np[1])
-
-    #         # Calculate SNR for enhanced signals and keep aligned versions
-    #         snr_enhanced_l, clean_aligned_enh_l, enhanced_aligned_l = calculate_snr_and_align(clean_np[0], enhanced_np[0])
-    #         snr_enhanced_r, clean_aligned_enh_r, enhanced_aligned_r = calculate_snr_and_align(clean_np[1], enhanced_np[1])
-
-    #         # Store SNR values
-    #         metrics['snr_noisy_l'].append(snr_noisy_l)
-    #         metrics['snr_noisy_r'].append(snr_noisy_r)
-    #         metrics['snr_enhanced_l'].append(snr_enhanced_l)
-    #         metrics['snr_enhanced_r'].append(snr_enhanced_r)
-
-    #         # Use aligned signals for STOI calculation
-    #         metrics['stoi_noisy_l'].append(stoi_metric(torch.from_numpy(clean_aligned_noisy_l), 
-    #                                                 torch.from_numpy(noisy_aligned_l)).item())
-    #         metrics['stoi_noisy_r'].append(stoi_metric(torch.from_numpy(clean_aligned_noisy_r), 
-    #                                                 torch.from_numpy(noisy_aligned_r)).item())
-    #         metrics['stoi_enhanced_l'].append(stoi_metric(torch.from_numpy(clean_aligned_enh_l), 
-    #                                                 torch.from_numpy(enhanced_aligned_l)).item())
-    #         metrics['stoi_enhanced_r'].append(stoi_metric(torch.from_numpy(clean_aligned_enh_r), 
-    #                                                 torch.from_numpy(enhanced_aligned_r)).item())
-            
-    #         # # Calculate MBSTOI if available
-    #         # if MBSTOI_AVAILABLE:
-    #         #     try:
-    #         #         metrics['mbstoi_noisy'].append(mbstoi(clean_np[0], clean_np[1], noisy_np[0], noisy_np[1]))
-    #         #         metrics['mbstoi_enhanced'].append(mbstoi(clean_np[0], clean_np[1], enhanced_np[0], enhanced_np[1]))
-    #         #     except Exception as e:
-    #         #         print(f"Error calculating MBSTOI: {e}")
-    #         #         metrics['mbstoi_noisy'].append(0)
-    #         #         metrics['mbstoi_enhanced'].append(0)
-
-    #         # Calculate MBSTOI if available
-    #         if MBSTOI_AVAILABLE:
-    #             try:
-    #                 # Use aligned signals for MBSTOI calculation
-    #                 metrics['mbstoi_noisy'].append(mbstoi(clean_aligned_noisy_l, clean_aligned_noisy_r, 
-    #                                                     noisy_aligned_l, noisy_aligned_r))
-    #                 metrics['mbstoi_enhanced'].append(mbstoi(clean_aligned_enh_l, clean_aligned_enh_r, 
-    #                                                     enhanced_aligned_l, enhanced_aligned_r))
-    #             except Exception as e:
-    #                 print(f"Error calculating MBSTOI: {e}")
-    #                 metrics['mbstoi_noisy'].append(0)
-    #                 metrics['mbstoi_enhanced'].append(0)
-            
-    #         # Calculate PESQ if available
-    #         # if PESQ_AVAILABLE:
-    #         #     try:
-    #         #         metrics['pesq_noisy_l'].append(pesq(SR, clean_np[0], noisy_np[0], 'wb'))
-    #         #         metrics['pesq_noisy_r'].append(pesq(SR, clean_np[1], noisy_np[1], 'wb'))
-    #         #         metrics['pesq_enhanced_l'].append(pesq(SR, clean_np[0], enhanced_np[0], 'wb'))
-    #         #         metrics['pesq_enhanced_r'].append(pesq(SR, clean_np[1], enhanced_np[1], 'wb'))
-    #         #     except Exception as e:
-    #         #         print(f"Error calculating PESQ: {e}")
-    #         #         metrics['pesq_noisy_l'].append(0)
-    #         #         metrics['pesq_noisy_r'].append(0)
-    #         #         metrics['pesq_enhanced_l'].append(0)
-    #         #         metrics['pesq_enhanced_r'].append(0)
-
-    #         # Calculate PESQ if available using aligned signals
-    #         if PESQ_AVAILABLE:
-    #             try:
-    #                 metrics['pesq_noisy_l'].append(pesq(SR, clean_aligned_noisy_l, noisy_aligned_l, 'wb'))
-    #                 metrics['pesq_noisy_r'].append(pesq(SR, clean_aligned_noisy_r, noisy_aligned_r, 'wb'))
-    #                 metrics['pesq_enhanced_l'].append(pesq(SR, clean_aligned_enh_l, enhanced_aligned_l, 'wb'))
-    #                 metrics['pesq_enhanced_r'].append(pesq(SR, clean_aligned_enh_r, enhanced_aligned_r, 'wb'))
-    #             except Exception as e:
-    #                 print(f"Error calculating PESQ: {e}")
-    #                 metrics['pesq_noisy_l'].append(0)
-    #                 metrics['pesq_noisy_r'].append(0)
-    #                 metrics['pesq_enhanced_l'].append(0)
-    #                 metrics['pesq_enhanced_r'].append(0)
-            
-    #         # # Calculate SNR
-    #         # metrics['snr_noisy_l'].append(calculate_snr(clean_np[0], noisy_np[0]))
-    #         # metrics['snr_noisy_r'].append(calculate_snr(clean_np[1], noisy_np[1]))
-    #         # metrics['snr_enhanced_l'].append(calculate_snr(clean_np[0], enhanced_np[0]))
-    #         # metrics['snr_enhanced_r'].append(calculate_snr(clean_np[1], enhanced_np[1]))
+    # Create summary visualizations
+    if all_results:
+        plot_metrics_by_snr(all_results, args.output_dir)
+        create_summary_report(all_results, args.output_dir)
         
-
-    #         noisy_stft_l = stft(prepare_for_stft(noisy_np[0])).squeeze(0).numpy()
-    #         noisy_stft_r = stft(prepare_for_stft(noisy_np[1])).squeeze(0).numpy()
-    #         enhanced_stft_l = stft(prepare_for_stft(enhanced_np[0])).squeeze(0).numpy()
-    #         enhanced_stft_r = stft(prepare_for_stft(enhanced_np[1])).squeeze(0).numpy()
-    #         clean_stft_l = stft(prepare_for_stft(clean_np[0])).squeeze(0).numpy()
-    #         clean_stft_r = stft(prepare_for_stft(clean_np[1])).squeeze(0).numpy()
+        # Also save all results as a CSV
+        summary_data = {
+            'SNR_Level': [],
+            'STOI_Noisy_L': [], 'STOI_Enhanced_L': [], 'STOI_Improvement_L': [],
+            'STOI_Noisy_R': [], 'STOI_Enhanced_R': [], 'STOI_Improvement_R': [],
+            'MBSTOI_Noisy': [], 'MBSTOI_Enhanced': [], 'MBSTOI_Improvement': [],
+            'SegSNR_Noisy_L': [], 'SegSNR_Enhanced_L': [], 'SegSNR_Improvement_L': [],
+            'SegSNR_Noisy_R': [], 'SegSNR_Enhanced_R': [], 'SegSNR_Improvement_R': [],
+            'ILD_Error': [], 'IPD_Error': []
+        }
+        
+        for result in all_results:
+            metrics = result['metrics']
+            summary_data['SNR_Level'].append(result['snr_level'])
             
-    #         # Calculate ILD and IPD errors
-    #         ild_error = calculate_ild_loss(clean_stft_l, clean_stft_r, enhanced_stft_l, enhanced_stft_r)
-    #         ipd_error = calculate_ipd_loss(clean_stft_l, clean_stft_r, enhanced_stft_l, enhanced_stft_r)
+            # Add metrics to summary data
+            summary_data['STOI_Noisy_L'].append(metrics['stoi_noisy_l'])
+            summary_data['STOI_Enhanced_L'].append(metrics['stoi_enhanced_l'])
+            summary_data['STOI_Improvement_L'].append(metrics['stoi_improvement_l'])
+            summary_data['STOI_Noisy_R'].append(metrics['stoi_noisy_r'])
+            summary_data['STOI_Enhanced_R'].append(metrics['stoi_enhanced_r'])
+            summary_data['STOI_Improvement_R'].append(metrics['stoi_improvement_r'])
             
-    #         metrics['ild_error'].append(ild_error)
-    #         metrics['ipd_error'].append(ipd_error)
-    with torch.no_grad():
-        for i, batch in enumerate(tqdm(dataloader, total=num_samples)):
-            if i >= num_samples:
-                break
-                
-            # Get data
-            noisy_samples = batch[0].to(device)
-            clean_samples = batch[1].to(device)
+            summary_data['MBSTOI_Noisy'].append(metrics['mbstoi_noisy'])
+            summary_data['MBSTOI_Enhanced'].append(metrics['mbstoi_enhanced'])
+            summary_data['MBSTOI_Improvement'].append(metrics['mbstoi_improvement'])
             
-            # Process with model
-            model_output = model(noisy_samples).cpu()
+            summary_data['SegSNR_Noisy_L'].append(metrics['snr_noisy_l'])
+            summary_data['SegSNR_Enhanced_L'].append(metrics['snr_enhanced_l'])
+            summary_data['SegSNR_Improvement_L'].append(metrics['snr_improvement_l'])
+            summary_data['SegSNR_Noisy_R'].append(metrics['snr_noisy_r'])
+            summary_data['SegSNR_Enhanced_R'].append(metrics['snr_enhanced_r'])
+            summary_data['SegSNR_Improvement_R'].append(metrics['snr_improvement_r'])
             
-            # Move tensors to CPU for analysis
-            noisy_samples = noisy_samples.cpu()
-            clean_samples = clean_samples.cpu()
-            
-            # Convert to numpy for easier processing
-            noisy_np = noisy_samples[0].numpy()
-            clean_np = clean_samples[0].numpy()
-            enhanced_np = model_output[0].numpy()
-            
-            # Calculate SegSNR and get aligned signals
-            seg_snr_noisy_l, clean_aligned_noisy_l, noisy_aligned_l = calculate_seg_snr(clean_np[0], noisy_np[0])
-            seg_snr_noisy_r, clean_aligned_noisy_r, noisy_aligned_r = calculate_seg_snr(clean_np[1], noisy_np[1])
-            seg_snr_enh_l, clean_aligned_enh_l, enhanced_aligned_l = calculate_seg_snr(clean_np[0], enhanced_np[0])
-            seg_snr_enh_r, clean_aligned_enh_r, enhanced_aligned_r = calculate_seg_snr(clean_np[1], enhanced_np[1])
-            
-            # Store SegSNR values
-            metrics['snr_noisy_l'].append(seg_snr_noisy_l)
-            metrics['snr_noisy_r'].append(seg_snr_noisy_r)
-            metrics['snr_enhanced_l'].append(seg_snr_enh_l)
-            metrics['snr_enhanced_r'].append(seg_snr_enh_r)
-            
-            # Calculate STOI using aligned signals
-            metrics['stoi_noisy_l'].append(stoi_metric(torch.from_numpy(clean_aligned_noisy_l), 
-                                                    torch.from_numpy(noisy_aligned_l)).item())
-            metrics['stoi_noisy_r'].append(stoi_metric(torch.from_numpy(clean_aligned_noisy_r), 
-                                                    torch.from_numpy(noisy_aligned_r)).item())
-            metrics['stoi_enhanced_l'].append(stoi_metric(torch.from_numpy(clean_aligned_enh_l), 
-                                                        torch.from_numpy(enhanced_aligned_l)).item())
-            metrics['stoi_enhanced_r'].append(stoi_metric(torch.from_numpy(clean_aligned_enh_r), 
-                                                        torch.from_numpy(enhanced_aligned_r)).item())
-            
-            # Calculate MBSTOI using aligned signals
-            if MBSTOI_AVAILABLE:
-                try:
-                    metrics['mbstoi_noisy'].append(mbstoi(clean_aligned_noisy_l, clean_aligned_noisy_r, 
-                                                        noisy_aligned_l, noisy_aligned_r))
-                    metrics['mbstoi_enhanced'].append(mbstoi(clean_aligned_enh_l, clean_aligned_enh_r, 
-                                                            enhanced_aligned_l, enhanced_aligned_r))
-                except Exception as e:
-                    print(f"Error calculating MBSTOI: {e}")
-                    metrics['mbstoi_noisy'].append(0)
-                    metrics['mbstoi_enhanced'].append(0)
-          
-            if PESQ_AVAILABLE:
-                try:
-                    # Make sure we're using the aligned signals
-                    clean_l, noisy_l = clean_aligned_noisy_l, noisy_aligned_l
-                    clean_r, noisy_r = clean_aligned_noisy_r, noisy_aligned_r
-                    enhanced_l, enhanced_r = enhanced_aligned_l, enhanced_aligned_r
-                    
-                    # Calculate PESQ
-                    metrics['pesq_noisy_l'].append(pesq(SR, clean_l, noisy_l, 'wb'))
-                    metrics['pesq_noisy_r'].append(pesq(SR, clean_r, noisy_r, 'wb'))
-                    metrics['pesq_enhanced_l'].append(pesq(SR, clean_l, enhanced_l, 'wb'))
-                    metrics['pesq_enhanced_r'].append(pesq(SR, clean_r, enhanced_r, 'wb'))
-                    
-                    print(f"PESQ Calculated - Noisy: {metrics['pesq_noisy_l'][-1]:.2f}/{metrics['pesq_noisy_r'][-1]:.2f}, "
-                        f"Enhanced: {metrics['pesq_enhanced_l'][-1]:.2f}/{metrics['pesq_enhanced_r'][-1]:.2f}")
-                except Exception as e:
-                    print(f"Error calculating PESQ: {e}")
-                    # Initialize these lists if they don't exist
-                    for key in ['pesq_noisy_l', 'pesq_noisy_r', 'pesq_enhanced_l', 'pesq_enhanced_r']:
-                        if key not in metrics:
-                            metrics[key] = []
-                        metrics[key].append(0)            
-            
-            # Use the proper STFT for all signals
-            noisy_stft_l = stft(prepare_for_stft(noisy_aligned_l)).squeeze(0).numpy()
-            noisy_stft_r = stft(prepare_for_stft(noisy_aligned_r)).squeeze(0).numpy()
-            enhanced_stft_l = stft(prepare_for_stft(enhanced_aligned_l)).squeeze(0).numpy()
-            enhanced_stft_r = stft(prepare_for_stft(enhanced_aligned_r)).squeeze(0).numpy()
-            clean_stft_l = stft(prepare_for_stft(clean_aligned_enh_l)).squeeze(0).numpy()
-            clean_stft_r = stft(prepare_for_stft(clean_aligned_enh_r)).squeeze(0).numpy()
-            
-            # Calculate ILD and IPD errors
-            ild_error = calculate_ild_loss(clean_stft_l, clean_stft_r, enhanced_stft_l, enhanced_stft_r)
-            ipd_error = calculate_ipd_loss(clean_stft_l, clean_stft_r, enhanced_stft_l, enhanced_stft_r)
-            
-            metrics['ild_error'].append(ild_error)
-            metrics['ipd_error'].append(ipd_error)
-
-            # Save audio files
-            save_dir = os.path.join(output_dir, f"sample_{i}")
-            os.makedirs(save_dir, exist_ok=True)
-            
-            sf.write(os.path.join(save_dir, "noisy_L.wav"), noisy_np[0], SR)
-            sf.write(os.path.join(save_dir, "noisy_R.wav"), noisy_np[1], SR)
-            sf.write(os.path.join(save_dir, "enhanced_L.wav"), enhanced_np[0], SR)
-            sf.write(os.path.join(save_dir, "enhanced_R.wav"), enhanced_np[1], SR)
-            sf.write(os.path.join(save_dir, "clean_L.wav"), clean_np[0], SR)
-            sf.write(os.path.join(save_dir, "clean_R.wav"), clean_np[1], SR)
-            
-            # Create visualizations
-            # 1. Spectrograms
-            plt.figure(figsize=(18, 12))
-            
-            # Left channel spectrograms
-            plt.subplot(3, 2, 1)
-            D = librosa.amplitude_to_db(np.abs(librosa.stft(noisy_np[0])), ref=np.max)
-            librosa.display.specshow(D, y_axis='log', x_axis='time', sr=SR)
-            plt.title('Noisy Left Channel')
-            plt.colorbar(format='%+2.0f dB')
-            
-            plt.subplot(3, 2, 3)
-            D = librosa.amplitude_to_db(np.abs(librosa.stft(enhanced_np[0])), ref=np.max)
-            librosa.display.specshow(D, y_axis='log', x_axis='time', sr=SR)
-            plt.title('Enhanced Left Channel')
-            plt.colorbar(format='%+2.0f dB')
-            
-            plt.subplot(3, 2, 5)
-            D = librosa.amplitude_to_db(np.abs(librosa.stft(clean_np[0])), ref=np.max)
-            librosa.display.specshow(D, y_axis='log', x_axis='time', sr=SR)
-            plt.title('Clean Left Channel')
-            plt.colorbar(format='%+2.0f dB')
-            
-            # Right channel spectrograms
-            plt.subplot(3, 2, 2)
-            D = librosa.amplitude_to_db(np.abs(librosa.stft(noisy_np[1])), ref=np.max)
-            librosa.display.specshow(D, y_axis='log', x_axis='time', sr=SR)
-            plt.title('Noisy Right Channel')
-            plt.colorbar(format='%+2.0f dB')
-            
-            plt.subplot(3, 2, 4)
-            D = librosa.amplitude_to_db(np.abs(librosa.stft(enhanced_np[1])), ref=np.max)
-            librosa.display.specshow(D, y_axis='log', x_axis='time', sr=SR)
-            plt.title('Enhanced Right Channel')
-            plt.colorbar(format='%+2.0f dB')
-            
-            plt.subplot(3, 2, 6)
-            D = librosa.amplitude_to_db(np.abs(librosa.stft(clean_np[1])), ref=np.max)
-            librosa.display.specshow(D, y_axis='log', x_axis='time', sr=SR)
-            plt.title('Clean Right Channel')
-            plt.colorbar(format='%+2.0f dB')
-            
-            plt.tight_layout()
-            plt.savefig(os.path.join(save_dir, "spectrograms.png"))
-            plt.close()
-            
-            # 2. Interaural Cues Visualization
-            plt.figure(figsize=(15, 10))
-            
-            # ILD visualization
-            plt.subplot(2, 2, 1)
-            plt.imshow(compute_ild_db(clean_stft_l, clean_stft_r), aspect='auto', origin='lower', cmap='coolwarm')
-            plt.colorbar(format='%+2.0f dB')
-            plt.title('Clean ILD (dB)')
-            plt.xlabel('Time Frame')
-            plt.ylabel('Frequency Bin')
-            
-            plt.subplot(2, 2, 2)
-            plt.imshow(compute_ild_db(enhanced_stft_l, enhanced_stft_r), aspect='auto', origin='lower', cmap='coolwarm')
-            plt.colorbar(format='%+2.0f dB')
-            plt.title('Enhanced ILD (dB)')
-            plt.xlabel('Time Frame')
-            plt.ylabel('Frequency Bin')
-            
-            # IPD visualization
-            plt.subplot(2, 2, 3)
-            plt.imshow(np.degrees(compute_ipd_rad(clean_stft_l, clean_stft_r)), aspect='auto', origin='lower', cmap='hsv', vmin=-180, vmax=180)
-            plt.colorbar(format='%+2.0f°')
-            plt.title('Clean IPD (degrees)')
-            plt.xlabel('Time Frame')
-            plt.ylabel('Frequency Bin')
-            
-            plt.subplot(2, 2, 4)
-            plt.imshow(np.degrees(compute_ipd_rad(enhanced_stft_l, enhanced_stft_r)), aspect='auto', origin='lower', cmap='hsv', vmin=-180, vmax=180)
-            plt.colorbar(format='%+2.0f°')
-            plt.title('Enhanced IPD (degrees)')
-            plt.xlabel('Time Frame')
-            plt.ylabel('Frequency Bin')
-            
-            plt.tight_layout()
-            plt.savefig(os.path.join(save_dir, "interaural_cues.png"))
-            plt.close()
-            
-            # Print current sample metrics
-            print(f"\nSample {i} Metrics:")
-            print(f"STOI (L/R): Noisy={metrics['stoi_noisy_l'][-1]:.3f}/{metrics['stoi_noisy_r'][-1]:.3f}, "
-                  f"Enhanced={metrics['stoi_enhanced_l'][-1]:.3f}/{metrics['stoi_enhanced_r'][-1]:.3f}")
-            if MBSTOI_AVAILABLE:
-                print(f"MBSTOI: Noisy={metrics['mbstoi_noisy'][-1]:.3f}, Enhanced={metrics['mbstoi_enhanced'][-1]:.3f}")
-            if PESQ_AVAILABLE:
-                if 'pesq_noisy_l' in metrics and metrics['pesq_noisy_l'] and 'pesq_noisy_r' in metrics and metrics['pesq_noisy_r']:
-                    print(f"PESQ (L/R): Noisy={metrics['pesq_noisy_l'][-1]:.2f}/{metrics['pesq_noisy_r'][-1]:.2f}, "
-                        f"Enhanced={metrics['pesq_enhanced_l'][-1]:.2f}/{metrics['pesq_enhanced_r'][-1]:.2f}")
-                else:
-                    print("PESQ metrics not available")
-            print(f"SNR (L/R): Noisy={metrics['snr_noisy_l'][-1]:.2f}/{metrics['snr_noisy_r'][-1]:.2f} dB, "
-                  f"Enhanced={metrics['snr_enhanced_l'][-1]:.2f}/{metrics['snr_enhanced_r'][-1]:.2f} dB")
-            print(f"ILD Error: {metrics['ild_error'][-1]:.2f} dB")
-            print(f"IPD Error: {metrics['ipd_error'][-1]:.2f} degrees")
-    
-    # Calculate average metrics
-    avg_metrics = {}
-    for key in metrics:
-        if len(metrics[key]) > 0:
-            avg_metrics[key] = np.mean(metrics[key])
-    
-    # Print average metrics
-    print("\n=== Average Metrics ===")
-    print(f"STOI (L/R): Noisy={avg_metrics.get('stoi_noisy_l', 0):.3f}/{avg_metrics.get('stoi_noisy_r', 0):.3f}, "
-          f"Enhanced={avg_metrics.get('stoi_enhanced_l', 0):.3f}/{avg_metrics.get('stoi_enhanced_r', 0):.3f}")
-    print(f"STOI Improvement (L/R): {avg_metrics.get('stoi_enhanced_l', 0) - avg_metrics.get('stoi_noisy_l', 0):.3f}/"
-          f"{avg_metrics.get('stoi_enhanced_r', 0) - avg_metrics.get('stoi_noisy_r', 0):.3f}")
-    
-    if MBSTOI_AVAILABLE:
-        print(f"MBSTOI: Noisy={avg_metrics.get('mbstoi_noisy', 0):.3f}, Enhanced={avg_metrics.get('mbstoi_enhanced', 0):.3f}")
-        print(f"MBSTOI Improvement: {avg_metrics.get('mbstoi_enhanced', 0) - avg_metrics.get('mbstoi_noisy', 0):.3f}")
-    
-    if PESQ_AVAILABLE:
-        print(f"PESQ (L/R): Noisy={avg_metrics.get('pesq_noisy_l', 0):.2f}/{avg_metrics.get('pesq_noisy_r', 0):.2f}, "
-              f"Enhanced={avg_metrics.get('pesq_enhanced_l', 0):.2f}/{avg_metrics.get('pesq_enhanced_r', 0):.2f}")
-        print(f"PESQ Improvement (L/R): {avg_metrics.get('pesq_enhanced_l', 0) - avg_metrics.get('pesq_noisy_l', 0):.2f}/"
-              f"{avg_metrics.get('pesq_enhanced_r', 0) - avg_metrics.get('pesq_noisy_r', 0):.2f}")
-    
-    print(f"SNR (L/R): Noisy={avg_metrics.get('snr_noisy_l', 0):.2f}/{avg_metrics.get('snr_noisy_r', 0):.2f} dB, "
-          f"Enhanced={avg_metrics.get('snr_enhanced_l', 0):.2f}/{avg_metrics.get('snr_enhanced_r', 0):.2f} dB")
-    print(f"SNR Improvement (L/R): {avg_metrics.get('snr_enhanced_l', 0) - avg_metrics.get('snr_noisy_l', 0):.2f}/"
-          f"{avg_metrics.get('snr_enhanced_r', 0) - avg_metrics.get('snr_noisy_r', 0):.2f} dB")
-    
-    print(f"ILD Error: {avg_metrics.get('ild_error', 0):.2f} dB")
-    print(f"IPD Error: {avg_metrics.get('ipd_error', 0):.2f} degrees")
-    
-    # Create summary visualization
-    plt.figure(figsize=(15, 10))
-    
-    plt.subplot(2, 2, 1)
-    plt.bar(['Noisy L', 'Noisy R', 'Enhanced L', 'Enhanced R'], 
-            [avg_metrics.get('stoi_noisy_l', 0), avg_metrics.get('stoi_noisy_r', 0), 
-             avg_metrics.get('stoi_enhanced_l', 0), avg_metrics.get('stoi_enhanced_r', 0)])
-    plt.ylabel('STOI')
-    plt.title('Speech Intelligibility')
-    plt.ylim(0, 1)
-    
-    plt.subplot(2, 2, 2)
-    if MBSTOI_AVAILABLE:
-        plt.bar(['Noisy', 'Enhanced'], 
-                [avg_metrics.get('mbstoi_noisy', 0), avg_metrics.get('mbstoi_enhanced', 0)])
-        plt.ylabel('MBSTOI')
-        plt.title('Binaural Speech Intelligibility')
-        plt.ylim(0, 1)
-    
-    plt.subplot(2, 2, 3)
-    plt.bar(['Noisy L', 'Noisy R', 'Enhanced L', 'Enhanced R'], 
-            [avg_metrics.get('snr_noisy_l', 0), avg_metrics.get('snr_noisy_r', 0), 
-             avg_metrics.get('snr_enhanced_l', 0), avg_metrics.get('snr_enhanced_r', 0)])
-    plt.ylabel('SNR (dB)')
-    plt.title('Signal-to-Noise Ratio')
-    
-    plt.subplot(2, 2, 4)
-    plt.bar(['ILD Error', 'IPD Error'], 
-            [avg_metrics.get('ild_error', 0), avg_metrics.get('ipd_error', 0)/10])  # Dividing IPD by 10 for scale
-    plt.ylabel('Error (dB / 10° for IPD)')
-    plt.title('Interaural Cue Preservation')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "summary_metrics.png"))
-    plt.close()
-    
-    # Save metrics to file
-    import pandas as pd
-    
-    # Save raw metrics
-    metrics_df = pd.DataFrame(metrics)
-    metrics_df.to_csv(os.path.join(output_dir, "detailed_metrics.csv"), index=False)
-    
-    # Save summary metrics
-    summary_metrics = {
-        'Metric': [
-            'STOI Noisy (L)', 'STOI Noisy (R)', 'STOI Enhanced (L)', 'STOI Enhanced (R)', 'STOI Improvement (L)', 'STOI Improvement (R)',
-            'MBSTOI Noisy', 'MBSTOI Enhanced', 'MBSTOI Improvement',
-            'PESQ Noisy (L)', 'PESQ Noisy (R)', 'PESQ Enhanced (L)', 'PESQ Enhanced (R)', 'PESQ Improvement (L)', 'PESQ Improvement (R)',
-            'SNR Noisy (L)', 'SNR Noisy (R)', 'SNR Enhanced (L)', 'SNR Enhanced (R)', 'SNR Improvement (L)', 'SNR Improvement (R)',
-            'ILD Error', 'IPD Error'
-        ],
-        'Value': [
-            avg_metrics.get('stoi_noisy_l', 0), avg_metrics.get('stoi_noisy_r', 0), 
-            avg_metrics.get('stoi_enhanced_l', 0), avg_metrics.get('stoi_enhanced_r', 0),
-            avg_metrics.get('stoi_enhanced_l', 0) - avg_metrics.get('stoi_noisy_l', 0),
-            avg_metrics.get('stoi_enhanced_r', 0) - avg_metrics.get('stoi_noisy_r', 0),
-            
-            avg_metrics.get('mbstoi_noisy', 0), avg_metrics.get('mbstoi_enhanced', 0),
-            avg_metrics.get('mbstoi_enhanced', 0) - avg_metrics.get('mbstoi_noisy', 0),
-            
-            avg_metrics.get('pesq_noisy_l', 0), avg_metrics.get('pesq_noisy_r', 0),
-            avg_metrics.get('pesq_enhanced_l', 0), avg_metrics.get('pesq_enhanced_r', 0),
-            avg_metrics.get('pesq_enhanced_l', 0) - avg_metrics.get('pesq_noisy_l', 0),
-            avg_metrics.get('pesq_enhanced_r', 0) - avg_metrics.get('pesq_noisy_r', 0),
-            
-            avg_metrics.get('snr_noisy_l', 0), avg_metrics.get('snr_noisy_r', 0),
-            avg_metrics.get('snr_enhanced_l', 0), avg_metrics.get('snr_enhanced_r', 0),
-            avg_metrics.get('snr_enhanced_l', 0) - avg_metrics.get('snr_noisy_l', 0),
-            avg_metrics.get('snr_enhanced_r', 0) - avg_metrics.get('snr_noisy_r', 0),
-            
-            avg_metrics.get('ild_error', 0), avg_metrics.get('ipd_error', 0)
-        ]
-    }
-    
-    summary_df = pd.DataFrame(summary_metrics)
-    summary_df.to_csv(os.path.join(output_dir, "summary_metrics.csv"), index=False)
-    
-    print(f"\nEvaluation completed. Results saved to {output_dir}")
-    
-    return metrics, avg_metrics
+            summary_data['ILD_Error'].append(metrics['ild_error'])
+            summary_data['IPD_Error'].append(metrics['ipd_error'])
+        
+        # Save as CSV
+        pd.DataFrame(summary_data).to_csv(os.path.join(args.output_dir, "all_results.csv"), index=False)
+        
+        print(f"\nEvaluation completed successfully. Results saved to {args.output_dir}")
+        print(f"Summary report: {os.path.join(args.output_dir, 'summary_report.md')}")
+        print(f"Summary CSV: {os.path.join(args.output_dir, 'all_results.csv')}")
+    else:
+        print("No valid results were obtained. Please check your data directories and SNR levels.")
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Evaluate binaural speech enhancement model")
-    parser.add_argument("--config_path", type=str, default="./config", help="Path to the config directory")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint")
-    parser.add_argument("--noisy_data", type=str, default=None, help="Path to noisy test dataset")
-    parser.add_argument("--clean_data", type=str, default=None, help="Path to clean test dataset")
-    parser.add_argument("--output_dir", type=str, default="evaluation_results", help="Directory to save results")
-    parser.add_argument("--num_samples", type=int, default=5, help="Number of samples to evaluate")
-    
-    args = parser.parse_args()
-    
-    evaluate_model(
-        config_path=args.config_path,
-        model_checkpoint_path=args.checkpoint,
-        noisy_dataset_path=args.noisy_data,
-        clean_dataset_path=args.clean_data,
-        output_dir=args.output_dir,
-        num_samples=args.num_samples
-    )
+    main()
