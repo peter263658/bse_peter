@@ -30,7 +30,7 @@ EPS = 1e-6
 class BinauralLoss(Module):
     def __init__(self, win_len=400,
                  win_inc=100, fft_len=512, sr=16000,
-                 ild_weight=0.1, ipd_weight=1, stoi_weight=0, 
+                 ild_weight=1, ipd_weight=10, stoi_weight=10, 
                  snr_loss_weight=1, verbose=False):
         
         super().__init__()
@@ -344,28 +344,8 @@ def comp_loss(target, output, comp_exp=0.3):
     
     return loss_comp.mean()
 
-# def speechMask(stft_l,stft_r, threshold=15):
-#     # breakpoint()
-#     _,_,time_bins = stft_l.shape
-#     thresh_l,_ = (((stft_l.abs())**2)).max(dim=2) 
-#     thresh_l_db = 10*torch.log10(thresh_l) - threshold
-#     thresh_l_db=thresh_l_db.unsqueeze(2).repeat(1,1,time_bins)
-    
-#     thresh_r,_ = (((stft_r.abs())**2)).max(dim=2) 
-#     thresh_r_db = 10*torch.log10(thresh_r) - threshold
-#     thresh_r_db=thresh_r_db.unsqueeze(2).repeat(1,1,time_bins)
-    
-    
-#     bin_mask_l = BinaryMask(threshold=thresh_l_db)
-#     bin_mask_r = BinaryMask(threshold=thresh_r_db)
-    
-#     mask_l = bin_mask_l(20*torch.log10((stft_l.abs())))
-#     mask_r = bin_mask_r(20*torch.log10((stft_r.abs())))
-#     mask = torch.bitwise_and(mask_l.int(), mask_r.int())
-    
-#     return mask
 
-def speechMask(stft_l, stft_r, threshold=15):
+def speechMask(stft_l, stft_r, threshold=20):
     """Create a speech binary mask using proper dimensionality
     
     Args:

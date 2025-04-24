@@ -36,14 +36,15 @@ import torch.nn as nn
 
 class Stft(nn.Module):
     def __init__(self, n_dft=1024, hop_size=512, win_length=None,
-                 onesided=True, is_complex=True, remove_dc=True):
+                 onesided=True, is_complex=True, remove_dc=False):
         super().__init__()
         self.n_dft = n_dft
         self.hop_size = hop_size
         self.win_length = n_dft if win_length is None else win_length
         self.onesided = onesided
         self.is_complex = is_complex
-        self.remove_dc = remove_dc
+        self.remove_dc = True
+        # self.remove_dc = False
 
     def forward(self, x: torch.Tensor):
         """Expected input has shape (batch_size, n_channels, time_steps) or (batch_size, time_steps) or (time_steps)"""

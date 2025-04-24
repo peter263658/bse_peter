@@ -53,10 +53,10 @@ class DCNNLightningModule(BaseLightningModule):
             else:
                 model = BinauralAttentionDCNN(**self._get_model_params())
             loss = BinauralLoss(
-                ild_weight=self._get_param("ild_weight", default=0.1),
-                ipd_weight=self._get_param("ipd_weight", default=1.0),
-                stoi_weight=self._get_param("stoi_weight", default=0.0),
-                snr_loss_weight=self._get_param("snr_loss_weight", default=1.0),
+                ild_weight=self._get_param("ild_weight", default=1),
+                ipd_weight=self._get_param("ipd_weight", default=10),
+                stoi_weight=self._get_param("stoi_weight", default=10),
+                snr_loss_weight=self._get_param("snr_loss_weight", default=1),
                 verbose=False,  # Add this to disable console printing
             )
         else:    

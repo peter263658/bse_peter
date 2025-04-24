@@ -24,7 +24,8 @@ def apply_mask(x, specs, masking_mode="E"):
     real = F.pad(real, [0, 0, 1, 0])
     imag = F.pad(imag, [0, 0, 1, 0])
 
-    # Generate output signal
-    out_spec = torch.complex(real, imag)
+    # out_spec = torch.complex(real, imag)
+    out_mag = torch.tanh(x.abs()) * specs.abs()
+    out_spec = out_mag * torch.exp(1j*(x.angle()+specs.angle()))  
 
     return out_spec

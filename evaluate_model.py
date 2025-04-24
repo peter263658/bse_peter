@@ -122,7 +122,7 @@ def calculate_mbstoi(clean_l, clean_r, proc_l, proc_r):
         proc_r = proc_r[:min_len]
         
         # Calculate MBSTOI
-        result = mbstoi(clean_l, clean_r, proc_l, proc_r)
+        result = mbstoi(proc_l, proc_r, clean_l, clean_r)
         return result
     except Exception as e:
         print(f"Error calculating MBSTOI: {e}")
