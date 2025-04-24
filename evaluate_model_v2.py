@@ -78,8 +78,6 @@ def calculate_mbstoi(clean_l, clean_r, proc_l, proc_r):
         proc_l = proc_l[:min_len]
         proc_r = proc_r[:min_len]
         
-                print(f"[DEBUG] MBSTOI Input Length: clean_l={len(clean_l)}, proc_l={len(proc_l)}")
-        print(f"[DEBUG] MBSTOI RMS: clean_l={np.sqrt(np.mean(clean_l**2)):.4f}, proc_l={np.sqrt(np.mean(proc_l**2)):.4f}")
         # Call the actual MBSTOI function
         result = mbstoi(clean_l, clean_r, proc_l, proc_r)
         return result
@@ -166,40 +164,40 @@ def calculate_ipd_loss(target_stft_l, target_stft_r, output_stft_l, output_stft_
         return 0
 
 
-def calculate_snr(clean, processed, max_delay=64):  # Increased from 10 to 64
-    """Calculate Signal-to-Noise Ratio in dB with proper alignment"""
+# def calculate_snr(clean, processed, max_delay=64):  # Increased from 10 to 64
+#     """Calculate Signal-to-Noise Ratio in dB with proper alignment"""
 #     # Ensure same length
-    min_len = min(len(clean), len(processed))
-    clean_temp = clean[:min_len].copy()
-    processed_temp = processed[:min_len].copy()
+#     min_len = min(len(clean), len(processed))
+#     clean_temp = clean[:min_len].copy()
+#     processed_temp = processed[:min_len].copy()
     
 #     # Find optimal alignment using cross-correlation
-    if max_delay > 0:
+#     if max_delay > 0:
 #         # Compute cross-correlation
-        corr = np.correlate(clean_temp, processed_temp, mode='full')
-        max_idx = np.argmax(np.abs(corr))
-        center = len(corr) // 2
-        delay = max_idx - center
+#         corr = np.correlate(clean_temp, processed_temp, mode='full')
+#         max_idx = np.argmax(np.abs(corr))
+#         center = len(corr) // 2
+#         delay = max_idx - center
         
 #         # Limit to max_delay
-        delay = max(min(delay, max_delay), -max_delay)
+#         delay = max(min(delay, max_delay), -max_delay)
         
 #         # Apply delay
-        if delay > 0:
+#         if delay > 0:
 #             # processed is delayed
-            clean = clean_temp[delay:]
-            processed = processed_temp[:-delay] if delay > 0 else processed_temp
-        else:
+#             clean = clean_temp[delay:]
+#             processed = processed_temp[:-delay] if delay > 0 else processed_temp
+#         else:
 #             # clean is delayed
-            clean = clean_temp[:delay] if delay < 0 else clean_temp
-            processed = processed_temp[-delay:]
+#             clean = clean_temp[:delay] if delay < 0 else clean_temp
+#             processed = processed_temp[-delay:]
             
 #         # Ensure same length after alignment
-        min_len = min(len(clean), len(processed))
-        clean = clean[:min_len]
-        processed = processed[:min_len]
-    else:
-        clean = clean_temp
+#         min_len = min(len(clean), len(processed))
+#         clean = clean[:min_len]
+#         processed = processed[:min_len]
+#     else:
+#         clean = clean_temp
 #         processed = processed_temp
     
 #     # Calculate energy of clean signal
