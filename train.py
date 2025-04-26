@@ -24,7 +24,6 @@ def train(config: DictConfig):
     # testing for speed up matmul
     torch.set_float32_matmul_precision('high')  # or 'medium' for a better balance
 
-    
     dataset_train, dataset_val, dataset_test = create_torch_dataloaders(config)
     
     trainer = DCNNTrainer(config)

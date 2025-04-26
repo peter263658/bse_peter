@@ -38,6 +38,9 @@ class BaseDataset(torch.utils.data.Dataset):
 
         noisy_signal, _ = torchaudio.load(noisy_audio_sample_path)
         
+        if noisy_signal.shape[0] != 2:
+            raise RuntimeError(f"{noisy_path} is not 2-channel WAV")
+
 
         if self.mono:
             return (noisy_signal[0], clean_signal[0])

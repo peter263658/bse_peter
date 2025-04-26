@@ -43,13 +43,19 @@ class BaseTrainer(pl.Trainer):
     def __init__(self, lightning_module, n_epochs,
                  use_checkpoint_callback=True, checkpoint_path=None,
                  early_stopping_config=None, strategy="null",
-                 accelerator='None', profiler='advanced'):
+                 accelerator=None, profiler='advanced',
+                 log_dir=None, checkpoint_dir=None):
 
         # Set up directories with better error handling
-        self.log_dir = log_dir or os.environ.get("BCCTN_LOG_DIR", "logs/")
-        self.checkpoint_dir = checkpoint_dir or os.environ.get("BCCTN_CHECKPOINT_DIR", "checkpoints/")
-        # Create directories safely
-        for directory in [self.log_dir, self.checkpoint_dir]:
+        # self.log_dir = log_dir or os.environ.get("BCCTN_LOG_DIR", "logs/")
+        # self.checkpoint_dir = checkpoint_dir or os.environ.get("BCCTN_CHECKPOINT_DIR", "checkpoints/")
+        _log_dir = log_dir or os.environ.get("BCCTN_LOG_DIR", "logs/")
+        _ckpt_dir = checkpoint_dir or os.environ.get("BCCTN_CHECKPOINT_DIR", "checkpoints/")
+
+        self._log_dir = _log_dir
+        self._checkpoint_dir = _ckpt_dir
+        # Create directories safe
+        for directory in [self._log_dir, self._checkpoint_dir]:
             try:
                 os.makedirs(directory, exist_ok=True)
                 print(f"Using directory: {directory}")
@@ -60,10 +66,10 @@ class BaseTrainer(pl.Trainer):
                 print(f"Falling back to: {fallback}")
                 os.makedirs(fallback, exist_ok=True)
                 
-                if directory == self.log_dir:
-                    self.log_dir = fallback
+                if directory == self._log_dir:
+                    self._log_dir = fallback
                 else:
-                    self.checkpoint_dir = fallback
+                    self._checkpoint_dir = fallback
                             
         # Check for PyTorch Lightning version compatibility
         import pytorch_lightning as pl
@@ -86,23 +92,32 @@ class BaseTrainer(pl.Trainer):
         print(f"Using strategy: {strategy_to_use or 'default'}")
 
         progress_bar = CustomProgressBar(refresh_rate=5)
-        early_stopping = EarlyStopping(early_stopping_config["key_to_monitor"],
-                                       early_stopping_config["min_delta"],
-                                       early_stopping_config["patience_in_epochs"]
-                                       )
-                                       
+        # early_stopping = EarlyStopping(early_stopping_config["key_to_monitor"],
+        #                                early_stopping_config["min_delta"],
+        #                                early_stopping_config["patience_in_epochs"]
+        #                                )
+        if early_stopping_config is not None:
+            early_stopping = EarlyStopping(
+                early_stopping_config["key_to_monitor"],
+                early_stopping_config["min_delta"],
+                early_stopping_config["patience_in_epochs"]
+            )
+        else:
+            early_stopping = None
+
+
         # Create checkpoint directory with explicit checks
-        if not os.path.exists(CHECKPOINT_DIR):
+        if not os.path.exists(self._checkpoint_dir):
             try:
-                os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-                print(f"Created checkpoint directory: {CHECKPOINT_DIR}")
+                os.makedirs(self._checkpoint_dir, exist_ok=True)
+                print(f"Created checkpoint directory: {self._checkpoint_dir}")
             except Exception as e:
                 print(f"Failed to create checkpoint directory: {e}")
                 print("Using current directory instead")
-                CHECKPOINT_DIR = "./"
-                
+                self._checkpoint_dir = "./"
+
         checkpoint_callback = ModelCheckpoint(
-            dirpath=CHECKPOINT_DIR,
+            dirpath=self._checkpoint_dir,
             monitor="validation_loss",
             save_last=True,
             save_top_k=3,
@@ -133,11 +148,14 @@ class BaseTrainer(pl.Trainer):
             flush_logs_every_n_steps=10  # More frequent flushing
         )
 
-        callbacks = [early_stopping, progress_bar]
+        callbacks = [progress_bar]
+        if early_stopping is not None:
+            callbacks.append(early_stopping)
         if use_checkpoint_callback:
             callbacks.append(checkpoint_callback)
 
         super().__init__(
+            default_root_dir=self._log_dir,
             max_epochs=n_epochs,
             callbacks=callbacks,
             logger=[tb_logger, csv_logger],
@@ -349,8 +367,8 @@ class BaseLightningModule(pl.LightningModule):
 class CustomProgressBar(TQDMProgressBar):
     def __init__(self, refresh_rate=1, process_position=0):
         super().__init__(refresh_rate=refresh_rate, process_position=process_position)
-        self.enable_progress_bar = True
-        self.refresh_rate = refresh_rate
+        # self.enable_progress_bar = True
+        # self.refresh_rate = refresh_rate
         
     def get_metrics(self, trainer, model):
         # don't show the version number
@@ -359,10 +377,10 @@ class CustomProgressBar(TQDMProgressBar):
         return items
     
     def disable(self):
-        self.enable_progress_bar = False
+        super().disable()
         
     def enable(self):
-        self.enable_progress_bar = True
+        super().enable()
 
 
 def _load_checkpoint(model, checkpoint_path):

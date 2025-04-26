@@ -380,7 +380,7 @@ def speechMask(stft_l, stft_r, threshold=20):
     for i in range(mask.shape[0]):
         if active_bins[i] < min_active_ratio * total_bins:
             # Sort energy values for this sample
-            energy_sample = mag_avg_db[i].view(-1)
+            energy_sample = mag_avg_db[i].reshape(-1)
             sorted_energy, _ = torch.sort(energy_sample, descending=True)
             
             # New threshold is the energy at the min_active_ratio percentile
