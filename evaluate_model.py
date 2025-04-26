@@ -292,103 +292,116 @@ def calculate_ipd_loss(target_stft_l, target_stft_r, output_stft_l, output_stft_
 def evaluate_file_pair(model, clean_path, noisy_path, device):
     """Evaluate a single pair of clean and noisy files"""
     try:
-        # Load audio files
-        clean, sr_clean = sf.read(clean_path)
-        noisy, sr_noisy = sf.read(noisy_path)
-        
-        # Ensure correct shape (should be [samples, 2] for stereo)
-        if clean.ndim == 1:
-            print(f"Warning: {clean_path} is mono, expected stereo")
+        # -----------------------------------------------------------
+        # 1. 讀檔 + 基本型態檢查
+        # -----------------------------------------------------------
+        clean, _ = sf.read(clean_path)
+        noisy, _ = sf.read(noisy_path)
+
+        # 轉成 [T, 2] stereo
+        if clean.ndim == 1 or noisy.ndim == 1:
+            print(f"Warning: {clean_path} or {noisy_path} is mono -> skip")
             return None
-        if noisy.ndim == 1:
-            print(f"Warning: {noisy_path} is mono, expected stereo")
-            return None
-        
-        # Transpose if needed
-        if clean.shape[1] != 2:
-            clean = clean.T
-        if noisy.shape[1] != 2:
-            noisy = noisy.T
-        
-        # Convert to correct format for model
+        if clean.shape[1] != 2:   clean = clean.T
+        if noisy.shape[1] != 2:   noisy = noisy.T
+
+        # L/R 先裁成同長
+        L = min(clean.shape[0], noisy.shape[0])
+        clean  = clean[:L, :]
+        noisy  = noisy[:L, :]
+
+        # -----------------------------------------------------------
+        # 2. forward 推論
+        # -----------------------------------------------------------
         noisy_tensor = torch.from_numpy(noisy.T).float().unsqueeze(0).to(device)
-        
-        # Process with model
         with torch.no_grad():
             enhanced_tensor = model(noisy_tensor).cpu()
-        
-        # Convert back to numpy
-        enhanced = enhanced_tensor[0].numpy().T
-        
-        # Extract channels
-        clean_l, clean_r = clean[:, 0], clean[:, 1]
-        noisy_l, noisy_r = noisy[:, 0], noisy[:, 1]
-        enhanced_l, enhanced_r = enhanced[:, 0], enhanced[:, 1]
-        
-        # Initialize audio processing tools
-        stft = Stft(n_dft=FFT_LEN, hop_size=WIN_INC, win_length=WIN_LEN)
+        enhanced = enhanced_tensor[0].numpy().T        # [T′, 2]
+
+        # -----------------------------------------------------------
+        # 3. 取得各通道 wave　★裁成「六條裡最短」★
+        # -----------------------------------------------------------
+        clean_l,  clean_r  = clean[:, 0],      clean[:, 1]
+        noisy_l,  noisy_r  = noisy[:, 0],      noisy[:, 1]
+        enh_l,    enh_r    = enhanced[:, 0],   enhanced[:, 1]
+
+        min_len = min(len(clean_l), len(clean_r),
+                      len(noisy_l), len(noisy_r),
+                      len(enh_l),   len(enh_r))
+        clean_l, clean_r = clean_l[:min_len], clean_r[:min_len]
+        noisy_l, noisy_r = noisy_l[:min_len], noisy_r[:min_len]
+        enh_l,   enh_r   = enh_l[:min_len],   enh_r[:min_len]
+
+        # -----------------------------------------------------------
+        # 4. 對齊 (以 cross-corr. 補 delay)  +  指標計算
+        # -----------------------------------------------------------
+        clean_l_n,  noisy_l  = align_signals(clean_l, noisy_l)
+        clean_r_n,  noisy_r  = align_signals(clean_r, noisy_r)
+        clean_l_e,  enh_l    = align_signals(clean_l, enh_l)
+        clean_r_e,  enh_r    = align_signals(clean_r, enh_r)
+
+        # again 裁掉 align 造成的殘差  ★
+        min_len = min(len(clean_l_n), len(noisy_l), len(enh_l),
+                      len(clean_r_n), len(noisy_r), len(enh_r))
+        clean_l_n, noisy_l, enh_l = clean_l_n[:min_len], noisy_l[:min_len], enh_l[:min_len]
+        clean_r_n, noisy_r, enh_r = clean_r_n[:min_len], noisy_r[:min_len], enh_r[:min_len]
+
+        # -------------  SegSNR / STOI / MBSTOI  --------------------
+        snr_noisy_l     = calculate_fw_seg_snr(clean_l_n, noisy_l, fs=SR)
+        snr_noisy_r     = calculate_fw_seg_snr(clean_r_n, noisy_r, fs=SR)
+        snr_enh_l       = calculate_fw_seg_snr(clean_l_e,  enh_l,  fs=SR)
+        snr_enh_r       = calculate_fw_seg_snr(clean_r_e,  enh_r,  fs=SR)
+
         stoi_metric = ShortTimeObjectiveIntelligibility(fs=SR)
-        
-        # Align signals for fair comparison
-        clean_l_n, noisy_l = align_signals(clean_l, noisy_l)
-        clean_r_n, noisy_r = align_signals(clean_r, noisy_r)
-        clean_l_e, enhanced_l = align_signals(clean_l, enhanced_l)
-        clean_r_e, enhanced_r = align_signals(clean_r, enhanced_r)
-        
-        # Calculate metrics
-        # 1. SegSNR
-        snr_noisy_l = calculate_fw_seg_snr(clean_l_n, noisy_l, fs=SR)
-        snr_noisy_r = calculate_fw_seg_snr(clean_r_n, noisy_r, fs=SR)
-        snr_enhanced_l = calculate_fw_seg_snr(clean_l_e, enhanced_l, fs=SR)
-        snr_enhanced_r = calculate_fw_seg_snr(clean_r_e, enhanced_r, fs=SR)
-        
-        # 2. STOI
-        stoi_noisy_l = stoi_metric(torch.from_numpy(clean_l_n), torch.from_numpy(noisy_l)).item()
-        stoi_noisy_r = stoi_metric(torch.from_numpy(clean_r_n), torch.from_numpy(noisy_r)).item()
-        stoi_enhanced_l = stoi_metric(torch.from_numpy(clean_l_e), torch.from_numpy(enhanced_l)).item()
-        stoi_enhanced_r = stoi_metric(torch.from_numpy(clean_r_e), torch.from_numpy(enhanced_r)).item()
-        
-        # 3. MBSTOI
-        mbstoi_noisy = calculate_mbstoi(clean_l_n, clean_r_n, noisy_l, noisy_r) if MBSTOI_AVAILABLE else 0
-        mbstoi_enhanced = calculate_mbstoi(clean_l_e, clean_r_e, enhanced_l, enhanced_r) if MBSTOI_AVAILABLE else 0
-        
-        # Apply STFT for interaural cues
-        noisy_stft_l = stft(prepare_for_stft(noisy_l)).squeeze(0).numpy()
-        noisy_stft_r = stft(prepare_for_stft(noisy_r)).squeeze(0).numpy()
-        enhanced_stft_l = stft(prepare_for_stft(enhanced_l)).squeeze(0).numpy()
-        enhanced_stft_r = stft(prepare_for_stft(enhanced_r)).squeeze(0).numpy()
-        clean_stft_l = stft(prepare_for_stft(clean_l_n)).squeeze(0).numpy()
-        clean_stft_r = stft(prepare_for_stft(clean_r_n)).squeeze(0).numpy()
-        
-        # 4. Calculate ILD and IPD errors
-        ild_error = calculate_ild_loss(clean_stft_l, clean_stft_r, enhanced_stft_l, enhanced_stft_r)
-        ipd_error = calculate_ipd_loss(clean_stft_l, clean_stft_r, enhanced_stft_l, enhanced_stft_r)
-        
-        # Return all metrics
+        stoi_noisy_l = stoi_metric(torch.from_numpy(clean_l_n),
+                                   torch.from_numpy(noisy_l)).item()
+        stoi_noisy_r = stoi_metric(torch.from_numpy(clean_r_n),
+                                   torch.from_numpy(noisy_r)).item()
+        stoi_enh_l   = stoi_metric(torch.from_numpy(clean_l_e),
+                                   torch.from_numpy(enh_l)).item()
+        stoi_enh_r   = stoi_metric(torch.from_numpy(clean_r_e),
+                                   torch.from_numpy(enh_r)).item()
+
+        mbstoi_noisy    = calculate_mbstoi(clean_l_n, clean_r_n, noisy_l, noisy_r) if MBSTOI_AVAILABLE else 0
+        mbstoi_enhanced = calculate_mbstoi(clean_l_e, clean_r_e,   enh_l,   enh_r) if MBSTOI_AVAILABLE else 0
+
+        # -------------  STFT → ILD / IPD  --------------------------
+        stft = Stft(n_dft=FFT_LEN, hop_size=WIN_INC, win_length=WIN_LEN)
+        #   建立 [1,1,T] tensor 再 STFT
+        to_tf = lambda x: stft(x[None, None, :]).squeeze(0).numpy()
+        noisy_tf_l, noisy_tf_r   = to_tf(noisy_l),   to_tf(noisy_r)
+        enh_tf_l,   enh_tf_r     = to_tf(enh_l),     to_tf(enh_r)
+        clean_tf_l, clean_tf_r   = to_tf(clean_l_n), to_tf(clean_r_n)
+
+        # ★ 裁 frame 數一致
+        min_T = min(noisy_tf_l.shape[-1], noisy_tf_r.shape[-1],
+                     enh_tf_l.shape[-1],  enh_tf_r.shape[-1],
+                     clean_tf_l.shape[-1],clean_tf_r.shape[-1])
+        noisy_tf_l  = noisy_tf_l[..., :min_T];  noisy_tf_r  = noisy_tf_r[..., :min_T]
+        enh_tf_l    = enh_tf_l[...,   :min_T];  enh_tf_r    = enh_tf_r[...,   :min_T]
+        clean_tf_l  = clean_tf_l[..., :min_T];  clean_tf_r  = clean_tf_r[..., :min_T]
+
+        ild_error = calculate_ild_loss(clean_tf_l, clean_tf_r, enh_tf_l, enh_tf_r)
+        ipd_error = calculate_ipd_loss(clean_tf_l, clean_tf_r, enh_tf_l, enh_tf_r)
+
+        # -----------------------------------------------------------
+        # 5. 組裝回傳 dict
+        # -----------------------------------------------------------
         return {
-            'stoi_noisy_l': stoi_noisy_l, 
-            'stoi_noisy_r': stoi_noisy_r,
-            'stoi_enhanced_l': stoi_enhanced_l, 
-            'stoi_enhanced_r': stoi_enhanced_r,
-            'mbstoi_noisy': mbstoi_noisy,
-            'mbstoi_enhanced': mbstoi_enhanced,
-            'snr_noisy_l': snr_noisy_l, 
-            'snr_noisy_r': snr_noisy_r,
-            'snr_enhanced_l': snr_enhanced_l, 
-            'snr_enhanced_r': snr_enhanced_r,
-            'ild_error': ild_error,
-            'ipd_error': ipd_error,
-            # Add file paths for reference
-            'clean_path': clean_path,
-            'noisy_path': noisy_path,
-            # Add audio for optional saving
-            'clean_audio': clean,
-            'noisy_audio': noisy,
+            'stoi_noisy_l': stoi_noisy_l,   'stoi_noisy_r': stoi_noisy_r,
+            'stoi_enhanced_l': stoi_enh_l,  'stoi_enhanced_r': stoi_enh_r,
+            'mbstoi_noisy': mbstoi_noisy,   'mbstoi_enhanced': mbstoi_enhanced,
+            'snr_noisy_l': snr_noisy_l,     'snr_noisy_r': snr_noisy_r,
+            'snr_enhanced_l': snr_enh_l,    'snr_enhanced_r': snr_enh_r,
+            'ild_error': ild_error,         'ipd_error': ipd_error,
+            'clean_audio': clean,           'noisy_audio': noisy,
             'enhanced_audio': enhanced
         }
+
     except Exception as e:
-        print(f"Error processing file pair {clean_path} and {noisy_path}: {e}")
+        print(f"[ERR] {clean_path} / {noisy_path}: {e}")
         return None
+
 
 def find_matching_clean_file(noisy_path, clean_dir):
     """Find the matching clean file for a noisy file"""
@@ -477,6 +490,10 @@ def evaluate_snr_level(model, clean_dir, noisy_dir, snr_level, device, num_sampl
     # Results for this SNR level
     results = []
     
+    # Add frame count tracking
+    frame_counts = {'file_name': [], 'left_frames': [], 'right_frames': [], 'frame_diff': []}
+    channel_lengths = {'file_name': [], 'clean_l': [], 'clean_r': [], 'noisy_l': [], 'noisy_r': [], 'enhanced_l': [], 'enhanced_r': []}
+    
     # Process each file
     for i, noisy_path in enumerate(tqdm(noisy_files, desc=f"Processing SNR {snr_level} dB")):
         # Find matching clean file
@@ -490,6 +507,42 @@ def evaluate_snr_level(model, clean_dir, noisy_dir, snr_level, device, num_sampl
         
         if metrics:
             results.append(metrics)
+            
+            # Track file lengths
+            file_name = os.path.basename(noisy_path)
+            channel_lengths['file_name'].append(file_name)
+            channel_lengths['clean_l'].append(len(metrics['clean_audio'][:,0]))
+            channel_lengths['clean_r'].append(len(metrics['clean_audio'][:,1]))
+            channel_lengths['noisy_l'].append(len(metrics['noisy_audio'][:,0]))
+            channel_lengths['noisy_r'].append(len(metrics['noisy_audio'][:,1]))
+            channel_lengths['enhanced_l'].append(len(metrics['enhanced_audio'][:,0]))
+            channel_lengths['enhanced_r'].append(len(metrics['enhanced_audio'][:,1]))
+            
+            # Use STFT to count frames
+            stft = Stft(n_dft=FFT_LEN, hop_size=WIN_INC, win_length=WIN_LEN)
+            try:
+                noisy_l = torch.from_numpy(metrics['noisy_audio'][:,0]).unsqueeze(0).unsqueeze(0)
+                noisy_r = torch.from_numpy(metrics['noisy_audio'][:,1]).unsqueeze(0).unsqueeze(0)
+                
+                # Apply STFT to get frame counts
+                noisy_stft_l = stft(noisy_l).squeeze(0)
+                noisy_stft_r = stft(noisy_r).squeeze(0)
+                
+                # Log frame counts
+                left_frames = noisy_stft_l.shape[-1]  # Last dimension is time frames
+                right_frames = noisy_stft_r.shape[-1]
+                frame_diff = abs(left_frames - right_frames)
+                
+                frame_counts['file_name'].append(file_name)
+                frame_counts['left_frames'].append(left_frames)
+                frame_counts['right_frames'].append(right_frames)
+                frame_counts['frame_diff'].append(frame_diff)
+                
+                # Print warning for files with frame differences
+                if frame_diff > 0:
+                    print(f"Warning: Frame count mismatch in {file_name}: L={left_frames}, R={right_frames}, diff={frame_diff}")
+            except Exception as e:
+                print(f"Error analyzing frames for {file_name}: {e}")
             
             # Save a few audio samples if requested
             if save_audio and output_dir and i < 5:  # Save first 5 samples
@@ -530,6 +583,18 @@ def evaluate_snr_level(model, clean_dir, noisy_dir, snr_level, device, num_sampl
     print(f"ILD Error: {avg_metrics['ild_error']:.2f} dB")
     print(f"IPD Error: {avg_metrics['ipd_error']:.2f} degrees")
     
+    # Print frame count statistics
+    if frame_counts['left_frames']:
+        print("\nSTFT Frame Count Statistics:")
+        left_frames = frame_counts['left_frames']
+        right_frames = frame_counts['right_frames']
+        frame_diffs = frame_counts['frame_diff']
+        
+        print(f"Left channel frames: min={min(left_frames)}, max={max(left_frames)}, avg={np.mean(left_frames):.1f}")
+        print(f"Right channel frames: min={min(right_frames)}, max={max(right_frames)}, avg={np.mean(right_frames):.1f}")
+        print(f"Frame differences: max={max(frame_diffs)}, avg={np.mean(frame_diffs):.2f}")
+        print(f"Files with frame differences: {sum(1 for d in frame_diffs if d > 0)}/{len(frame_diffs)}")
+    
     # Save detailed metrics if output directory is provided
     if output_dir:
         snr_dir = os.path.join(output_dir, f"snr_{snr_level}dB")
@@ -561,11 +626,27 @@ def evaluate_snr_level(model, clean_dir, noisy_dir, snr_level, device, num_sampl
                     for r in results]
         raw_df = pd.DataFrame(raw_data)
         raw_df.to_csv(os.path.join(snr_dir, "raw_results.csv"), index=False)
+        
+        # Save frame count data
+        if frame_counts['left_frames']:
+            frame_df = pd.DataFrame(frame_counts)
+            frame_df.to_csv(os.path.join(snr_dir, "frame_counts.csv"), index=False)
+            
+        # Save channel length data
+        if channel_lengths['clean_l']:
+            lengths_df = pd.DataFrame(channel_lengths)
+            lengths_df.to_csv(os.path.join(snr_dir, "channel_lengths.csv"), index=False)
     
     return {
         'snr_level': snr_level,
         'metrics': avg_metrics,
-        'num_samples': len(results)
+        'num_samples': len(results),
+        'frame_stats': {
+            'left_frames_avg': np.mean(frame_counts['left_frames']) if frame_counts['left_frames'] else 0,
+            'right_frames_avg': np.mean(frame_counts['right_frames']) if frame_counts['right_frames'] else 0,
+            'frame_diff_avg': np.mean(frame_counts['frame_diff']) if frame_counts['frame_diff'] else 0,
+            'files_with_frame_diff': sum(1 for d in frame_counts['frame_diff'] if d > 0) if frame_counts['frame_diff'] else 0
+        }
     }
 
 def plot_metrics_by_snr(all_results, output_dir):

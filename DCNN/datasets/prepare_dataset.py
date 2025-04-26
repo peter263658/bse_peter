@@ -348,25 +348,13 @@ def spatialize_speech(speech, hrir_db, azimuth, elevation=0, distance=80, sr=TAR
     speech = speech.flatten()
     
     # Apply HRIRs to speech with full convolution
-    # According to HRIR_README, should use 'full' and then handle the result
     left_channel = signal.convolve(speech, left_hrir, mode='full')
     right_channel = signal.convolve(speech, right_hrir, mode='full')
     
-    # Trim to match original speech length with proper alignment
-    # HRIR causes delay, so we need to handle this carefully
-    hrir_len = len(left_hrir)
-    speech_len = len(speech)
-    delay = hrir_len // 2  # Approximate delay introduced by HRIR
-    
-    # Trim convolution result accounting for delay
-    left_channel = left_channel[delay:delay + speech_len]
-    right_channel = right_channel[delay:delay + speech_len]
-    
-    # Normalize according to HRIR_README
-    max_amp = max(np.max(np.abs(left_channel)), np.max(np.abs(right_channel)))
-    if max_amp > 0:
-        left_channel = left_channel / max_amp
-        right_channel = right_channel / max_amp
+    # Ensure both channels have the same length (take the shorter one)
+    min_length = min(len(left_channel), len(right_channel))
+    left_channel = left_channel[:min_length]
+    right_channel = right_channel[:min_length]
     
     # Stack channels
     binaural_speech = np.vstack((left_channel, right_channel))
@@ -402,13 +390,39 @@ def generate_isotropic_noise(noise_samples, hrir_db, duration, sr=TARGET_SR):
         # Get HRIR for this azimuth
         left_hrir, right_hrir = get_closest_hrir(hrir_db, azimuth)
         
-        # Apply HRIR to noise (spatial convolution)
-        left_spatialized = signal.convolve(noise_segment, left_hrir, mode='same')
-        right_spatialized = signal.convolve(noise_segment, right_hrir, mode='same')
+        # Prepare HRIRs - flatten and ensure they're not too long
+        left_hrir = left_hrir.flatten()
+        right_hrir = right_hrir.flatten()
         
-        # Add to the binaural noise
-        left_noise += left_spatialized
-        right_noise += right_spatialized
+        # Ensure HRIR length is reasonable for convolution (not longer than signal)
+        max_hrir_length = min(len(left_hrir), len(right_hrir), n_samples // 4)
+        left_hrir = left_hrir[:max_hrir_length]
+        right_hrir = right_hrir[:max_hrir_length]
+        
+        # Apply HRIR to noise using full convolution and truncate
+        try:
+            # Full convolution
+            left_full = signal.convolve(noise_segment, left_hrir)
+            right_full = signal.convolve(noise_segment, right_hrir)
+            
+            # Truncate to match original length
+            offset = len(left_hrir) // 2
+            left_spatialized = left_full[offset:offset + n_samples]
+            right_spatialized = right_full[offset:offset + n_samples]
+            
+            # In case the convolution result is shorter than expected
+            if len(left_spatialized) < n_samples:
+                left_spatialized = np.pad(left_spatialized, (0, n_samples - len(left_spatialized)))
+            if len(right_spatialized) < n_samples:
+                right_spatialized = np.pad(right_spatialized, (0, n_samples - len(right_spatialized)))
+            
+            # Add to the binaural noise
+            left_noise += left_spatialized[:n_samples]  
+            right_noise += right_spatialized[:n_samples]
+            
+        except Exception as e:
+            print(f"Warning: Error in convolution for azimuth {azimuth}: {e}")
+            continue
     
     # Normalize
     max_val = max(np.max(np.abs(left_noise)), np.max(np.abs(right_noise)))
@@ -418,7 +432,7 @@ def generate_isotropic_noise(noise_samples, hrir_db, duration, sr=TARGET_SR):
     
     return np.vstack((left_noise, right_noise))
 
-# def spatialize_speech(speech, hrir_db, azimuth, elevation=0, distance=80, sr=TARGET_SR):
+def spatialize_speech(speech, hrir_db, azimuth, elevation=0, distance=80, sr=TARGET_SR):
     """
     Spatialize monaural speech using HRIR at specified azimuth and elevation
     """
@@ -432,10 +446,52 @@ def generate_isotropic_noise(noise_samples, hrir_db, duration, sr=TARGET_SR):
     # Ensure speech is also 1D
     speech = speech.flatten()
     
-    # Apply HRIRs to speech (spatial convolution)
-    # Use mode='full' and truncate to the length of the speech
-    left_channel = signal.convolve(speech, left_hrir, mode='same')
-    right_channel = signal.convolve(speech, right_hrir, mode='same')
+    # Ensure HRIR is not too long
+    max_hrir_length = min(len(left_hrir), len(right_hrir), len(speech) // 4)
+    left_hrir = left_hrir[:max_hrir_length]
+    right_hrir = right_hrir[:max_hrir_length]
+    
+    # Apply HRIRs to speech with full convolution
+    try:
+        left_channel = signal.convolve(speech, left_hrir, mode='full')
+        right_channel = signal.convolve(speech, right_hrir, mode='full')
+        
+        # Trim to have same length as original speech with proper alignment
+        # The HRIR causes delay, so align properly
+        offset = len(left_hrir) // 2
+        speech_len = len(speech)
+        
+        # Check if convolution result is long enough
+        if len(left_channel) >= offset + speech_len:
+            left_channel = left_channel[offset:offset + speech_len]
+        else:
+            # Pad if needed
+            left_channel = np.pad(left_channel, (0, max(0, offset + speech_len - len(left_channel))))
+            left_channel = left_channel[:speech_len]
+            
+        if len(right_channel) >= offset + speech_len:
+            right_channel = right_channel[offset:offset + speech_len]
+        else:
+            # Pad if needed
+            right_channel = np.pad(right_channel, (0, max(0, offset + speech_len - len(right_channel))))
+            right_channel = right_channel[:speech_len]
+        
+        # Ensure both channels have exactly the same length
+        min_length = min(len(left_channel), len(right_channel), speech_len)
+        left_channel = left_channel[:min_length]
+        right_channel = right_channel[:min_length]
+        
+        # Normalize to avoid clipping
+        max_amp = max(np.max(np.abs(left_channel)), np.max(np.abs(right_channel)))
+        if max_amp > 0:
+            left_channel = left_channel / max_amp * 0.95
+            right_channel = right_channel / max_amp * 0.95
+        
+    except Exception as e:
+        print(f"Error in spatialization: {e}")
+        # Fallback: return unprocessed speech in both channels
+        left_channel = speech
+        right_channel = speech
     
     # Stack channels
     binaural_speech = np.vstack((left_channel, right_channel))

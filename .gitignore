@@ -6,7 +6,9 @@ __pycache__/
 *.pth
 .vscode/
 DCNN/datasets/DATASET/
-evaluation_results/
+evaluation_results*/
 *.log
 outputs/
 mbstoi.egg*
+*.wav
+
