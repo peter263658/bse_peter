@@ -11,4 +11,7 @@ evaluation_results*/
 outputs/
 mbstoi.egg*
 *.wav
+evaluation_results*/
+evaluation_results_*/
+
 
