@@ -255,11 +255,10 @@ def speech_mask(stft_l, stft_r, threshold=20):
     
     if active_ratio < 0.1:  # If less than 10% active, adjust threshold
         # Sort energies and take top 10%
-        flattened = energy.flatten()
-        sorted_energy = np.sort(flattened)[::-1]  # Sort descending
-        new_threshold = sorted_energy[int(0.1 * total_bins)]
-        mask = (energy >= new_threshold)
-    
+        if np.all(np.isneginf(energy)):
+            return np.zeros_like(energy, dtype=bool)
+        new_threshold = np.percentile(energy, 90)   # 取能量前 10 %
+        mask = energy >= new_threshold
     return mask
 
 def calculate_ild_loss(target_stft_l, target_stft_r, output_stft_l, output_stft_r):
@@ -426,7 +425,9 @@ def evaluate_file_pair(model, clean_path, noisy_path, device):
             enh_tf_r = safe_stft(enh_r)
             
             # Check if any STFT failed
-            if None in [clean_tf_l, clean_tf_r, noisy_tf_l, noisy_tf_r, enh_tf_l, enh_tf_r]:
+            # if None in [clean_tf_l, clean_tf_r, noisy_tf_l, noisy_tf_r, enh_tf_l, enh_tf_r]:
+            #     raise ValueError("One or more STFTs failed")
+            if any(x is None for x in (clean_tf_l, clean_tf_r, noisy_tf_l, noisy_tf_r, enh_tf_l,  enh_tf_r)):
                 raise ValueError("One or more STFTs failed")
                 
             # Trim to matching frames

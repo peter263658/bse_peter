@@ -283,14 +283,12 @@ class MultiAttnBlock(nn.Module):
             self.input_projection = nn.Linear(
                 in_features=actual_input_size,
                 out_features=self.embed_dim,
-                dtype=torch.complex64
-            ).to(device)
+                dtype=torch.complex64).to(device)
             
             self.output_projection = nn.Linear(
                 in_features=self.embed_dim,
                 out_features=actual_input_size,
-                dtype=torch.complex64
-            ).to(device)
+                dtype=torch.complex64).to(device)
             
             print(f"Created dynamic attention projections with size: {actual_input_size} on device: {device}")
         else:
